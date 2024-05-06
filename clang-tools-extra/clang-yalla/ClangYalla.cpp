@@ -36,51 +36,6 @@ struct ClassInfo {
   ClassInfo(std::string Name, std::string FileName, bool HasDefinition) : Name(std::move(Name)), FileName(std::move(FileName)), HasDefinition(HasDefinition) {}
 };
 
-StatementMatcher LoopMatcher =
-  forStmt(hasLoopInit(declStmt(hasSingleDecl(varDecl(
-    hasInitializer(integerLiteral(equals(0)))))))).bind("forLoop");
-
-// StatementMatcher FieldMatcher =
-//  declStmt(
-//   containsDeclaration(0,
-//     fieldDecl(
-//       // hasType(
-//       //   asString("Container")
-//       //   )
-//       )
-//     )
-//   ).bind("ContainerType");
-
-DeclarationMatcher FieldMatcher =
-    fieldDecl(
-      hasType(
-        asString("Container")
-        )
-      ).bind("ContainerType");
-
-// ABOVE MATCHES CONTAINER, BUT NOT REFERENCE OR POINTER
-// DeclarationMatcher ReferenceFieldMatcher =
-//     fieldDecl(
-//       hasTypeLoc(referenceTypeLoc(loc(
-//         asString("Container")
-//         )
-//       ))).bind("ContainerType2");
-
-// This works for references
-DeclarationMatcher ReferenceFieldMatcher =
-    fieldDecl(
-      hasType(
-        asString("Container &")
-        )
-      ).bind("ContainerType2");
-
-// This works for pointers
-DeclarationMatcher PointerFieldMatcher =
-    fieldDecl(
-      hasType(
-        asString("Container *")
-        )
-      ).bind("ContainerType3");
 
 DeclarationMatcher ClassMatcher = cxxRecordDecl().bind("ClassDeclaration");
 DeclarationMatcher ClassUsageMatcher = anyOf(
@@ -89,42 +44,16 @@ DeclarationMatcher ClassUsageMatcher = anyOf(
   parmVarDecl(hasType(cxxRecordDecl(isClass()))).bind("Parameter")
 );
 
-// Find all fields, vars, and params using those classes
-// Also find methods and 
-
-// DeclarationMatcher PointerFieldMatcher =
-//     fieldDecl(
-//       hasType(
-//         asString("Container")
-//         )
-//       ).bind("ContainerType");
-
-// Matcher<Decl> = hasType(asString("Container")).bind("ContainerType");
-
-
-class LoopPrinter : public MatchFinder::MatchCallback {
-public :
-  virtual void run(const MatchFinder::MatchResult &Result) {
-    std::cout << "maybe this loop\n";
-    if (const ForStmt *FS = Result.Nodes.getNodeAs<clang::ForStmt>("forLoop"))
-      FS->dump();
-  }
-};
-
 
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
   virtual void run(const MatchFinder::MatchResult &Result) {
     if (const FieldDecl *FD = Result.Nodes.getNodeAs<clang::FieldDecl>("Field")) {
       std::cout << "Got field " << FD->getNameAsString() << '\n';
-      // std::cout << "one\n";
-      // FD->dump();
     }
 
     if (const VarDecl *VD = Result.Nodes.getNodeAs<clang::VarDecl>("Variable")) {
       std::cout << "Got variable " << VD->getNameAsString() << '\n';
-      // std::cout << "two\n";
-      // FD->dump();
     }
 
     if (const ParmVarDecl *PD = Result.Nodes.getNodeAs<clang::ParmVarDecl>("Parameter")) {
@@ -133,7 +62,6 @@ public:
 
     if (const CXXRecordDecl *RD = Result.Nodes.getNodeAs<clang::CXXRecordDecl>("ClassDeclaration")) {
       AddClassInfo(RD, Result.Context);
-      // RD->dump();
     }
 
     if (const CXXRecordDecl *RD = Result.Nodes.getNodeAs<clang::CXXRecordDecl>("ClassUsage")) {
