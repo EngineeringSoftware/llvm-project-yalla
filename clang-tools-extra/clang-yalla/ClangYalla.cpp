@@ -11,6 +11,9 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/CommandLine.h"
 
+#include "ClangYallaAnalysis.h"
+#include "ClangYallaUtilities.h"
+
 using namespace clang::tooling;
 using namespace llvm;
 
@@ -32,66 +35,6 @@ static llvm::cl::opt<std::string>
 
 using namespace clang;
 using namespace clang::ast_matchers;
-
-struct TypeScopes {
-  enum class ScopeType {
-    ClassScope,
-    NamespaceScope,
-  };
-
-  std::string Name;
-  ScopeType Type;
-
-  TypeScopes(std::string Name, ScopeType Type)
-      : Name(std::move(Name)), Type(Type) {}
-};
-
-struct ClassUsage {
-  std::string TypeName;
-  bool IsPointer;
-
-  ClassUsage(std::string TypeName, bool IsPointer)
-      : TypeName(std::move(TypeName)), IsPointer(IsPointer) {}
-};
-
-struct FunctionUsage {
-  std::string Name; // TODO: This is redundant for now, but I'm keeping it
-                    // because I need to store source info
-
-  FunctionUsage(std::string Name) : Name(std::move(Name)) {}
-};
-
-struct ClassInfo {
-  std::string Name;
-  std::string FileName;
-  bool HasDefinition;
-  std::vector<TypeScopes> Scopes;
-  std::vector<ClassUsage> Usages;
-
-  ClassInfo(std::string Name, std::string FileName, bool HasDefinition,
-            std::vector<TypeScopes> &&Scopes)
-      : Name(std::move(Name)), FileName(std::move(FileName)),
-        HasDefinition(HasDefinition), Scopes(std::move(Scopes)), Usages() {}
-};
-
-struct FunctionInfo {
-  std::string Name;
-  std::string FileName;
-  std::string ClassName;
-  bool HasDefinition;
-  bool IsTemplate;
-  std::vector<TypeScopes> Scopes;
-  std::vector<FunctionUsage> Usages;
-
-  FunctionInfo(std::string Name, std::string FileName, std::string ClassName,
-               bool HasDefinition, bool IsTemplate,
-               std::vector<TypeScopes> &&Scopes)
-      : Name(std::move(Name)), FileName(std::move(FileName)),
-        ClassName(std::move(ClassName)), HasDefinition(HasDefinition),
-        IsTemplate(IsTemplate), Scopes(std::move(Scopes)), Usages() {}
-
-  bool IsMethod() const { return ClassName != ""; }
-};
 
 // Need the isImplicit check since each definition contains an
 // implicit node that references itself.
@@ -168,7 +111,7 @@ public:
 
     if (const CallExpr *CE =
             Result.Nodes.getNodeAs<clang::CallExpr>("FunctionCall")) {
-      std::string FileName = GetContainingFile(CE->getDirectCallee());
+      std::string FileName = GetContainingFile(CE);
       if (SourcePaths.find(FileName) != SourcePaths.end())
         AddFunctionUsage(CE);
     }
@@ -188,7 +131,12 @@ public:
     }
   }
 
-  std::unordered_map<std::string, ClassInfo> &GetClasses() { return Classes; }
+  const std::unordered_map<std::string, ClassInfo> &GetClasses() const {
+    return Classes;
+  }
+  const std::unordered_map<std::string, FunctionInfo> &GetFunctions() const {
+    return Functions;
+  }
 
 private:
   std::unordered_map<std::string, ClassInfo> Classes;
@@ -240,7 +188,7 @@ private:
 
     auto [FI, NewlyInserted] = Functions.try_emplace(
         FullyScopedName, Name, FileName, ClassName, FD->isDefined(),
-        FD->isTemplated(), std::move(Scopes));
+        FD->isTemplated(), std::move(Scopes), FD);
     if (!NewlyInserted) {
       FI->second.HasDefinition |= FD->isDefined();
     }
@@ -270,6 +218,18 @@ private:
     const SourceManager &SrcMgr = Context.getSourceManager();
     const FileEntry *Entry =
         SrcMgr.getFileEntryForID(SrcMgr.getFileID(D->getLocation()));
+    return Entry->getName().str();
+  }
+
+  std::string GetContainingFile(const CallExpr *CE) const {
+    const ASTContext &Context =
+        CE->getDirectCallee()->getDeclContext()->getParentASTContext();
+    // From
+    // https://stackoverflow.com/questions/25075001/how-can-i-get-the-name-of-the-file-im-currently-visiting-with-clang
+    // on how to get source file
+    const SourceManager &SrcMgr = Context.getSourceManager();
+    const FileEntry *Entry =
+        SrcMgr.getFileEntryForID(SrcMgr.getFileID(CE->getExprLoc()));
     return Entry->getName().str();
   }
 
@@ -367,6 +327,8 @@ int main(int argc, const char **argv) {
 
   YM.PrintClasses();
   YM.PrintFunctions();
+
+  ForwardDeclareFunctions(OptionsParser, YM.GetFunctions());
 
   return result;
 }
