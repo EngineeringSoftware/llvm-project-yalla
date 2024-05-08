@@ -97,6 +97,35 @@ std::vector<std::string> GenerateForwardDeclarations(
   return ForwardDeclarations;
 }
 
+std::vector<FunctionDecl*> GenerateForwardDeclarationsDecls(
+    const std::unordered_map<std::string, FunctionInfo> &AllFunctions) {
+  std::vector<FunctionDecl*> ForwardDeclarations;
+  for (const auto &[Name, FI] : AllFunctions) {
+    if (FI.Usages.size() == 0)
+      continue;
+
+    // Not supported for now
+    if (FI.IsMethod())
+      continue;
+
+    // FunctionDecl *FD = FunctionDecl::Create(
+    //   FI.FD->getASTContext(),
+    //   FI.FD->getDeclContext(),
+    //   FI.FD->getBeginLoc(),
+    //   FI.FD->getLocation(),
+    //   FI.FD->getDeclName(),
+    //   FI.FD->getType(),
+    //   FI.FD->getTypeSourceInfo(),
+    //   SC_None
+    // )
+
+    // FD->setBody(nullptr);
+    // ForwardDeclarations.push_back(FD);
+  }
+
+  return ForwardDeclarations;
+}
+
 void ForwardDeclareFunctions(
     CommonOptionsParser &OptionsParser,
     const std::unordered_map<std::string, FunctionInfo> &AllFunctions) {
@@ -109,6 +138,8 @@ void ForwardDeclareFunctions(
 
   std::vector<std::string> Functions =
       GenerateForwardDeclarations(AllFunctions);
+  std::vector<FunctionDecl*> FunctionDecls =
+      GenerateForwardDeclarationsDecls(AllFunctions);
   auto ActionFactory =
       std::make_unique<ForwardDeclrarerAction>(SourceRewriter, Functions);
 
