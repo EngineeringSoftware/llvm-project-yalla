@@ -31,15 +31,9 @@ public:
     SourceLocation loc = Context.getSourceManager().getLocForStartOfFile(
         Context.getSourceManager().getMainFileID());
 
-    std::cout << "Inserting classes\n";
-    // InsertClassDeclarations(loc);
-    std::cout << "Inserting functions\n";
-    // InsertFunctionDeclarations(loc);
-    for (const std::string &Decl : FunctionDeclarations) {
-      SourceRewriter.InsertText(loc, Decl + '\n');
-    }
+    InsertClassDeclarations(loc);
+    InsertFunctionDeclarations(loc);
 
-    std::cout << "overwriting\n";
     SourceRewriter.overwriteChangedFiles();
   }
 
@@ -50,9 +44,7 @@ private:
 
   void InsertClassDeclarations(const SourceLocation &loc) const {
     for (const std::string &Decl : ClassDeclarations) {
-      std::cout << "doing " << Decl << '\n';
       SourceRewriter.InsertText(loc, Decl + '\n');
-      std::cout << "done\n";
     }
   }
 
@@ -86,27 +78,20 @@ std::string GetFunctionSignature(const FunctionDecl *FD) {
   std::string ReturnType = FD->getReturnType().getAsString();
   std::string Name = FD->getNameAsString();
 
-  std::cout << "Getting params\n";
   std::string Parameters = "";
   for (const auto &Param : FD->parameters()) {
-    std::cout << "first part " << Param->getType().getAsString() << '\n';
     Parameters += Param->getType().getAsString();
     Parameters += " ";
-    std::cout << "doing second part \n";
-    std::cout << "second part " << Param->getNameAsString() << '\n';
     Parameters += Param->getNameAsString();
     Parameters += ", ";
   }
 
-  std::cout << "removing stuff\n";
-  std::cout << Parameters << '\n';
   // Remove the ', '
   if (!Parameters.empty()) {
     Parameters.pop_back();
     Parameters.pop_back();
   }
 
-  std::cout << "returning\n";
   return ReturnType + " " + Name + "(" + Parameters + ");";
 }
 
@@ -185,24 +170,19 @@ void ForwardDeclareClassesAndFunctions(
     break;
   }
 
-  std::cout << "Getting class decls\n";
   std::vector<std::string> Classes =
       GenerateClassForwardDeclarations(AllClasses);
-  std::cout << "Getting function decls\n";
   std::vector<std::string> Functions =
       GenerateFunctionForwardDeclarations(AllFunctions);
   // std::vector<FunctionDecl*> FunctionDecls =
   //     GenerateForwardDeclarationsDecls(AllFunctions);
-  std::cout << "Getting factory\n";
   auto ActionFactory = std::make_unique<ForwardDeclrarerAction>(
       SourceRewriter, Classes, Functions);
 
   ClangTool Tool(OptionsParser.getCompilations(),
                  OptionsParser.getSourcePathList());
-  std::cout << "Running tool\n";
   Tool.run(newFrontendActionFactory<ForwardDeclrarerAction>(ActionFactory.get())
                .get());
-  std::cout << "Done Running tool\n";
 }
 
 #endif
