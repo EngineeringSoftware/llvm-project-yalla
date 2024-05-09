@@ -74,6 +74,29 @@ private:
   const std::vector<std::string> &FunctionDeclarations;
 };
 
+std::string SurroundWithScopes(const std::string &Declaration,
+                               const std::vector<TypeScope> &Scopes) {
+  bool SeenClass = false;
+  std::string Start = "";
+  std::string End = "";
+  for (const TypeScope &Scope : Scopes) {
+    switch (Scope.Type) {
+    case TypeScope::ScopeType::NamespaceScope:
+      Start += "namespace " + Scope.Name + " {";
+      End += "}";
+      break;
+    case TypeScope::ScopeType::ClassScope:
+      llvm::report_fatal_error(
+          "ERROR: scoping with classes unsupported for now\n");
+      break;
+    }
+  }
+
+  std::reverse(End.begin(), End.end());
+
+  return Start + Declaration + End;
+}
+
 std::string GetFunctionSignature(const FunctionDecl *FD) {
   std::string ReturnType = FD->getReturnType().getAsString();
   std::string Name = FD->getNameAsString();
@@ -110,7 +133,9 @@ std::vector<std::string> GenerateFunctionForwardDeclarations(
     if (FI.IsMethod())
       continue;
 
-    ForwardDeclarations.push_back(GetFunctionSignature(FI.FD));
+    std::string Declaration = GetFunctionSignature(FI.FD);
+    std::string ScopedDeclaration = SurroundWithScopes(Declaration, FI.Scopes);
+    ForwardDeclarations.push_back(ScopedDeclaration);
   }
 
   return ForwardDeclarations;
@@ -123,7 +148,9 @@ std::vector<std::string> GenerateClassForwardDeclarations(
     if (CI.Usages.size() == 0)
       continue;
 
-    ForwardDeclarations.push_back(GetClassDeclaration(CI.RD));
+    std::string Declaration = GetClassDeclaration(CI.RD);
+    std::string ScopedDeclaration = SurroundWithScopes(Declaration, CI.Scopes);
+    ForwardDeclarations.push_back(ScopedDeclaration);
   }
 
   return ForwardDeclarations;

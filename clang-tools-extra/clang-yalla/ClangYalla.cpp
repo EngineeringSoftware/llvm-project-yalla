@@ -242,7 +242,7 @@ private:
     return Type;
   }
 
-  std::pair<std::vector<TypeScopes>, std::string>
+  std::pair<std::vector<TypeScope>, std::string>
   GetScopes(QualType Type) const {
     const RecordType *RT = Type->getAs<RecordType>();
     if (RT == nullptr)
@@ -252,18 +252,18 @@ private:
     return GetScopes(RD);
   }
 
-  std::pair<std::vector<TypeScopes>, std::string>
+  std::pair<std::vector<TypeScope>, std::string>
   GetScopes(const Decl *D) const {
-    std::vector<TypeScopes> Scopes;
+    std::vector<TypeScope> Scopes;
     const DeclContext *DC = D->getDeclContext();
 
     while (DC && !DC->isTranslationUnit()) {
       if (const NamespaceDecl *NS = dyn_cast<NamespaceDecl>(DC)) {
         Scopes.emplace(Scopes.begin(), NS->getNameAsString(),
-                       TypeScopes::ScopeType::NamespaceScope);
+                       TypeScope::ScopeType::NamespaceScope);
       } else if (const RecordDecl *RD = dyn_cast<RecordDecl>(DC)) {
         Scopes.emplace(Scopes.begin(), RD->getNameAsString(),
-                       TypeScopes::ScopeType::ClassScope);
+                       TypeScope::ScopeType::ClassScope);
       } else {
         llvm_unreachable("Scope can only be namespace or class");
       }

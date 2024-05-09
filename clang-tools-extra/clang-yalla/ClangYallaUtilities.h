@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-struct TypeScopes {
+struct TypeScope {
   enum class ScopeType {
     ClassScope,
     NamespaceScope,
@@ -14,7 +14,7 @@ struct TypeScopes {
   std::string Name;
   ScopeType Type;
 
-  TypeScopes(std::string Name, ScopeType Type)
+  TypeScope(std::string Name, ScopeType Type)
       : Name(std::move(Name)), Type(Type) {}
 };
 
@@ -37,12 +37,12 @@ struct ClassInfo {
   std::string Name;
   std::string FileName;
   bool HasDefinition;
-  std::vector<TypeScopes> Scopes;
+  std::vector<TypeScope> Scopes;
   std::vector<ClassUsage> Usages;
   const clang::RecordDecl *RD;
 
   ClassInfo(std::string Name, std::string FileName, bool HasDefinition,
-            std::vector<TypeScopes> &&Scopes, const clang::RecordDecl *RD)
+            std::vector<TypeScope> &&Scopes, const clang::RecordDecl *RD)
       : Name(std::move(Name)), FileName(std::move(FileName)),
         HasDefinition(HasDefinition), Scopes(std::move(Scopes)), Usages(),
         RD(RD) {}
@@ -54,13 +54,13 @@ struct FunctionInfo {
   std::string ClassName;
   bool HasDefinition;
   bool IsTemplate;
-  std::vector<TypeScopes> Scopes;
+  std::vector<TypeScope> Scopes;
   std::vector<FunctionUsage> Usages;
   const clang::FunctionDecl *FD;
 
   FunctionInfo(std::string Name, std::string FileName, std::string ClassName,
                bool HasDefinition, bool IsTemplate,
-               std::vector<TypeScopes> &&Scopes, const clang::FunctionDecl *FD)
+               std::vector<TypeScope> &&Scopes, const clang::FunctionDecl *FD)
       : Name(std::move(Name)), FileName(std::move(FileName)),
         ClassName(std::move(ClassName)), HasDefinition(HasDefinition),
         IsTemplate(IsTemplate), Scopes(std::move(Scopes)), Usages(), FD(FD) {}
