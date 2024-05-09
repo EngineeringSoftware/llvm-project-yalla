@@ -39,11 +39,13 @@ struct ClassInfo {
   bool HasDefinition;
   std::vector<TypeScopes> Scopes;
   std::vector<ClassUsage> Usages;
+  const clang::RecordDecl *RD;
 
   ClassInfo(std::string Name, std::string FileName, bool HasDefinition,
-            std::vector<TypeScopes> &&Scopes)
+            std::vector<TypeScopes> &&Scopes, const clang::RecordDecl *RD)
       : Name(std::move(Name)), FileName(std::move(FileName)),
-        HasDefinition(HasDefinition), Scopes(std::move(Scopes)), Usages() {}
+        HasDefinition(HasDefinition), Scopes(std::move(Scopes)), Usages(),
+        RD(RD) {}
 };
 
 struct FunctionInfo {

@@ -154,7 +154,7 @@ private:
     FullyScopedName += Name;
 
     auto [CI, NewlyInserted] = Classes.try_emplace(
-        FullyScopedName, Name, FileName, HasDefinition, std::move(Scopes));
+        FullyScopedName, Name, FileName, HasDefinition, std::move(Scopes), RD);
     if (!NewlyInserted) {
       CI->second.HasDefinition |= HasDefinition;
     }
@@ -328,7 +328,8 @@ int main(int argc, const char **argv) {
   YM.PrintClasses();
   YM.PrintFunctions();
 
-  ForwardDeclareFunctions(OptionsParser, YM.GetFunctions());
+  ForwardDeclareClassesAndFunctions(OptionsParser, YM.GetClasses(),
+                                    YM.GetFunctions());
 
   return result;
 }
