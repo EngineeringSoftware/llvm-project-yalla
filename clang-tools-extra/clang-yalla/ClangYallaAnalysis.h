@@ -200,8 +200,6 @@ void ForwardDeclareClassesAndFunctions(
   DiagnosticsEngine Diagnostics(new DiagnosticIDs, &*DiagOpts);
   TextDiagnosticPrinter DiagnosticPrinter(llvm::outs(), &*DiagOpts);
   SourceManager SM(Diagnostics, Tool.getFiles());
-  SM.PrintStats();
-  SM.dump();
 
   Rewriter SourceRewriter;
   SourceRewriter.setSourceMgr(SM, LangOptions());
