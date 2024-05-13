@@ -10,8 +10,10 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendActions.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "clang/Tooling/CommonOptionsParser.h"
+#include "clang/Tooling/Refactoring.h"
 #include "clang/Tooling/Tooling.h"
 
 #include "ClangYallaUtilities.h"
@@ -118,9 +120,10 @@ std::string GetFunctionSignature(const FunctionDecl *FD) {
   return ReturnType + " " + Name + "(" + Parameters + ");";
 }
 
-std::string GetClassDeclaration(const RecordDecl *RD) {
-  return (RD->isStruct() ? "struct " : "class ") + RD->getNameAsString() + ";";
-}
+// std::string GetClassDeclaration(const RecordDecl *RD) {
+//   return (RD->isStruct() ? "struct " : "class ") + RD->getNameAsString() +
+//   ";";
+// }
 
 std::vector<std::string> GenerateFunctionForwardDeclarations(
     const std::unordered_map<std::string, FunctionInfo> &AllFunctions) {
@@ -135,21 +138,6 @@ std::vector<std::string> GenerateFunctionForwardDeclarations(
 
     std::string Declaration = GetFunctionSignature(FI.FD);
     std::string ScopedDeclaration = SurroundWithScopes(Declaration, FI.Scopes);
-    ForwardDeclarations.push_back(ScopedDeclaration);
-  }
-
-  return ForwardDeclarations;
-}
-
-std::vector<std::string> GenerateClassForwardDeclarations(
-    const std::unordered_map<std::string, ClassInfo> &AllClasses) {
-  std::vector<std::string> ForwardDeclarations;
-  for (const auto &[Name, CI] : AllClasses) {
-    if (CI.Usages.size() == 0)
-      continue;
-
-    std::string Declaration = GetClassDeclaration(CI.RD);
-    std::string ScopedDeclaration = SurroundWithScopes(Declaration, CI.Scopes);
     ForwardDeclarations.push_back(ScopedDeclaration);
   }
 
@@ -185,31 +173,65 @@ std::vector<FunctionDecl *> GenerateForwardDeclarationsDecls(
   return ForwardDeclarations;
 }
 
+void MakeClassesForwardDeclarable(
+    const std::unordered_map<std::string, ClassInfo> &Classes,
+    const SourceManager &SM, std::map<std::string, Replacements> &Replace) {
+  for (const auto &[Name, CI] : Classes) {
+    for (const ClassUsage &Usage : CI.Usages) {
+      if (Usage.IsPointer)
+        continue;
+
+      std::string NewDeclaration = Usage.TypeName + "* " + Usage.VariableName;
+
+      llvm::Error Err = Replace[Usage.FileName].add(
+          Replacement(SM, Usage.Range, NewDeclaration));
+      std::cout << llvm::toString(std::move(Err)) << '\n';
+    }
+  }
+}
+
 void ForwardDeclareClassesAndFunctions(
-    CommonOptionsParser &OptionsParser,
+    RefactoringTool &Tool,
     const std::unordered_map<std::string, ClassInfo> &AllClasses,
     const std::unordered_map<std::string, FunctionInfo> &AllFunctions) {
-  Rewriter SourceRewriter;
-  // Need to set SourceManager, don't see another way to do this now
-  for (const auto &[Name, FI] : AllFunctions) {
-    SourceRewriter.setSourceMgr(FI.FD->getASTContext().getSourceManager(),
-                                FI.FD->getASTContext().getLangOpts());
-    break;
-  }
 
-  std::vector<std::string> Classes =
-      GenerateClassForwardDeclarations(AllClasses);
-  std::vector<std::string> Functions =
-      GenerateFunctionForwardDeclarations(AllFunctions);
+  // This approach is better than the for loop beneath.
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts(new DiagnosticOptions);
+  DiagnosticsEngine Diagnostics(new DiagnosticIDs, &*DiagOpts);
+  TextDiagnosticPrinter DiagnosticPrinter(llvm::outs(), &*DiagOpts);
+  SourceManager SM(Diagnostics, Tool.getFiles());
+  SM.PrintStats();
+  SM.dump();
+
+  Rewriter SourceRewriter;
+  SourceRewriter.setSourceMgr(SM, LangOptions());
+
+  // // Need to set SourceManager, don't see another way to do this now
+  // for (const auto &[Name, FI] : AllFunctions) {
+  //   SourceRewriter.setSourceMgr(FI.FD->getASTContext().getSourceManager(),
+  //                               FI.FD->getASTContext().getLangOpts());
+  //   break;
+  // }
+
+  // MakeClassesForwardDeclarable(AllClasses, SourceRewriter.getSourceMgr(),
+  // Tool.getReplacements());
+  // if (!Tool.applyAllReplacements(SourceRewriter)) {
+  //   std::cout << "replacements didn't work\n";
+  // }
+
+  // std::vector<std::string> Classes =
+  //     GenerateClassForwardDeclarations(AllClasses);
+  // std::vector<std::string> Functions =
+  //     GenerateFunctionForwardDeclarations(AllFunctions);
   // std::vector<FunctionDecl*> FunctionDecls =
   //     GenerateForwardDeclarationsDecls(AllFunctions);
-  auto ActionFactory = std::make_unique<ForwardDeclrarerAction>(
-      SourceRewriter, Classes, Functions);
+  // auto ActionFactory = std::make_unique<ForwardDeclrarerAction>(
+  //     SourceRewriter, Classes, Functions);
 
-  ClangTool Tool(OptionsParser.getCompilations(),
-                 OptionsParser.getSourcePathList());
-  Tool.run(newFrontendActionFactory<ForwardDeclrarerAction>(ActionFactory.get())
-               .get());
+  // SourceRewriter.overwriteChangedFiles();
+
+  // Tool.run(newFrontendActionFactory<ForwardDeclrarerAction>(ActionFactory.get())
+  //              .get());
 }
 
 #endif

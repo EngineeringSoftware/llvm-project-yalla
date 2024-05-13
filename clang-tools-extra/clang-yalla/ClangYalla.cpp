@@ -69,8 +69,16 @@ StatementMatcher FunctionCallMatcher = callExpr().bind("FunctionCall");
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
   YallaMatcher(const std::unordered_set<std::string> &SourcePaths,
-               const std::string &HeaderPath)
-      : SourcePaths(SourcePaths), HeaderPath(HeaderPath) {}
+               const std::string &HeaderPath,
+               std::map<std::string, Replacements> &Replace)
+      : SourcePaths(SourcePaths), HeaderPath(HeaderPath), Replace(Replace) {}
+
+  virtual void onEndOfTranslationUnit() override {
+    if (ForwardDeclarations == "")
+      return;
+
+    Replace[MainFilename].add(Replacement(*SM, loc, 0, ForwardDeclarations));
+  }
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
     if (const RecordDecl *RD =
@@ -143,6 +151,27 @@ private:
   std::unordered_map<std::string, FunctionInfo> Functions;
   const std::unordered_set<std::string> &SourcePaths;
   const std::string &HeaderPath;
+  std::map<std::string, Replacements> &Replace;
+  std::string ForwardDeclarations = "";
+  SourceLocation loc;
+  std::string MainFilename;
+  SourceManager *SM;
+
+  std::string GetClassDeclaration(const RecordDecl *RD) const {
+    return (RD->isStruct() ? "struct " : "class ") + RD->getNameAsString() +
+           ";";
+  }
+
+  std::string
+  GenerateClassForwardDeclaration(const RecordDecl *RD,
+                                  const std::vector<TypeScope> &Scopes) const {
+    std::vector<std::string> ForwardDeclarations;
+
+    std::string Declaration = GetClassDeclaration(RD);
+    std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
+
+    return ScopedDeclaration + "\n";
+  }
 
   void AddClassInfo(const RecordDecl *RD, const std::string &FileName) {
     std::string Name = RD->getNameAsString();
@@ -153,8 +182,21 @@ private:
       FullyScopedName += "::";
     FullyScopedName += Name;
 
-    auto [CI, NewlyInserted] = Classes.try_emplace(
-        FullyScopedName, Name, FileName, HasDefinition, std::move(Scopes), RD);
+    if (Classes.find(FullyScopedName) == Classes.end()) {
+      std::string ForwardDeclaration =
+          GenerateClassForwardDeclaration(RD, Scopes);
+      loc = RD->getASTContext().getSourceManager().getLocForStartOfFile(
+          RD->getASTContext().getSourceManager().getMainFileID());
+      ForwardDeclarations += ForwardDeclaration;
+      MainFilename = FileName;
+      SM = &(RD->getASTContext().getSourceManager());
+    }
+
+    CharSourceRange Range =
+        CharSourceRange::getCharRange(RD->getBeginLoc(), RD->getEndLoc());
+    auto [CI, NewlyInserted] =
+        Classes.try_emplace(FullyScopedName, Name, FileName, HasDefinition,
+                            std::move(Scopes), RD, Range);
     if (!NewlyInserted) {
       CI->second.HasDefinition |= HasDefinition;
     }
@@ -172,9 +214,21 @@ private:
     if (it == Classes.end())
       llvm::report_fatal_error("Found class usage before definition");
 
+    std::string NewDeclaration =
+        Type.getAsString() + "* " + VD->getNameAsString();
+
+    std::string Filename = GetContainingFile(VD);
+    CharSourceRange Range =
+        CharSourceRange::getTokenRange(VD->getBeginLoc(), VD->getEndLoc());
+    if (!(VD->getType()->isReferenceType() || VD->getType()->isPointerType())) {
+      llvm::Error Err = Replace[FileName].add(Replacement(
+          VD->getASTContext().getSourceManager(), Range, NewDeclaration));
+    }
+
     ClassInfo &CI = it->second;
-    CI.Usages.emplace_back(Type.getAsString(),
-                           Type->isReferenceType() || Type->isPointerType());
+    CI.Usages.emplace_back(VD->getNameAsString(), Type.getAsString(), Filename,
+                           Type->isReferenceType() || Type->isPointerType(), VD,
+                           Range);
   }
 
   void AddFunctionInfo(const FunctionDecl *FD, const std::string &FileName,
@@ -186,9 +240,12 @@ private:
       FullyScopedName += "::";
     FullyScopedName += Name;
 
+    CharSourceRange Range =
+        CharSourceRange::getCharRange(FD->getBeginLoc(), FD->getEndLoc());
+
     auto [FI, NewlyInserted] = Functions.try_emplace(
         FullyScopedName, Name, FileName, ClassName, FD->isDefined(),
-        FD->isTemplated(), std::move(Scopes), FD);
+        FD->isTemplated(), std::move(Scopes), FD, Range);
     if (!NewlyInserted) {
       FI->second.HasDefinition |= FD->isDefined();
     }
@@ -316,7 +373,7 @@ int main(int argc, const char **argv) {
   RefactoringTool Tool(OptionsParser.getCompilations(),
                        OptionsParser.getSourcePathList());
 
-  YallaMatcher YM(SourcePaths, HeaderAbsolutePath);
+  YallaMatcher YM(SourcePaths, HeaderAbsolutePath, Tool.getReplacements());
   MatchFinder Finder;
   Finder.addMatcher(ClassMatcher, &YM);
   Finder.addMatcher(ClassUsageMatcher, &YM);
@@ -328,8 +385,18 @@ int main(int argc, const char **argv) {
   YM.PrintClasses();
   YM.PrintFunctions();
 
-  ForwardDeclareClassesAndFunctions(OptionsParser, YM.GetClasses(),
-                                    YM.GetFunctions());
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts = new DiagnosticOptions();
+  DiagnosticsEngine Diagnostics(
+      IntrusiveRefCntPtr<DiagnosticIDs>(new DiagnosticIDs()), &*DiagOpts,
+      new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts), true);
+  SourceManager Sources(Diagnostics, Tool.getFiles());
+
+  Rewriter Rewrite(Sources, LangOptions());
+  Tool.applyAllReplacements(Rewrite);
+
+  Rewrite.overwriteChangedFiles();
+
+  ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(), YM.GetFunctions());
 
   return result;
 }
