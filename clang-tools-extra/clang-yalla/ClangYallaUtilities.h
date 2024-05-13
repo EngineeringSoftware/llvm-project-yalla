@@ -82,4 +82,16 @@ struct FunctionInfo {
   bool IsMethod() const { return ClassName != ""; }
 };
 
+struct WrapperInfo {
+  std::string WrapperName;
+  std::string WrapperReturnType;
+  std::string WrapperParameters; // Of the form "(int a, ...)"
+
+  WrapperInfo(std::string &&WrapperName, std::string &&WrapperReturnType,
+              std::string &&WrapperParameters)
+      : WrapperName(std::move(WrapperName)),
+        WrapperReturnType(std::move(WrapperReturnType)),
+        WrapperParameters(std::move(WrapperParameters)) {}
+};
+
 #endif

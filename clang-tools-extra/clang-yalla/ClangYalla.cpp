@@ -74,10 +74,9 @@ public:
       : SourcePaths(SourcePaths), HeaderPath(HeaderPath), Replace(Replace) {}
 
   virtual void onEndOfTranslationUnit() override {
-    if (ForwardDeclarations == "")
-      return;
-
-    Replace[MainFilename].add(Replacement(*SM, loc, 0, ForwardDeclarations));
+    if (ClassForwardDeclarations != "" && FunctionForwardDeclarations != "")
+      Replace[MainFilename].add(Replacement(
+          *SM, loc, 0, ClassForwardDeclarations + FunctionForwardDeclarations));
   }
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
@@ -152,10 +151,36 @@ private:
   const std::unordered_set<std::string> &SourcePaths;
   const std::string &HeaderPath;
   std::map<std::string, Replacements> &Replace;
-  std::string ForwardDeclarations = "";
+  std::string ClassForwardDeclarations = "";
+  std::string FunctionForwardDeclarations = "";
   SourceLocation loc;
   std::string MainFilename;
   SourceManager *SM;
+  std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
+
+  bool FunctionNeedsWrapper(const FunctionDecl *FD) const {
+    QualType ReturnType = FD->getReturnType();
+    if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
+      return true;
+
+    return false;
+  }
+
+  void AddFunctionWrapper(const FunctionDecl *FD,
+                          const std::string &FullyScopedName) {
+    QualType ReturnType = FD->getReturnType();
+    const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl();
+
+    std::string WrapperName = "Wrapper_" + FD->getNameAsString();
+    std::string WrapperReturnType = ReturnType.getAsString() + "*";
+    std::string WrapperParameters = GetFunctionParameters(FD);
+
+    FunctionForwardDeclarations +=
+        WrapperReturnType + " " + WrapperName + WrapperParameters + ";\n";
+    FunctionWrappers.try_emplace(FullyScopedName, std::move(WrapperName),
+                                 std::move(WrapperReturnType),
+                                 std::move(WrapperParameters));
+  }
 
   std::string GetClassDeclaration(const RecordDecl *RD) const {
     return (RD->isStruct() ? "struct " : "class ") + RD->getNameAsString() +
@@ -165,9 +190,42 @@ private:
   std::string
   GenerateClassForwardDeclaration(const RecordDecl *RD,
                                   const std::vector<TypeScope> &Scopes) const {
-    std::vector<std::string> ForwardDeclarations;
-
     std::string Declaration = GetClassDeclaration(RD);
+    std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
+
+    return ScopedDeclaration + "\n";
+  }
+
+  // Returns the parameters as "(int a, double n, ...)"
+  std::string GetFunctionParameters(const FunctionDecl *FD) const {
+    std::string Parameters = "";
+    for (const auto &Param : FD->parameters()) {
+      Parameters += Param->getType().getAsString();
+      Parameters += " ";
+      Parameters += Param->getNameAsString();
+      Parameters += ", ";
+    }
+
+    // Remove the ', '
+    if (!Parameters.empty()) {
+      Parameters.pop_back();
+      Parameters.pop_back();
+    }
+
+    return "(" + Parameters + ")";
+  }
+
+  std::string GetFunctionSignature(const FunctionDecl *FD) const {
+    std::string ReturnType = FD->getReturnType().getAsString();
+    std::string Name = FD->getNameAsString();
+    std::string Parameters = GetFunctionParameters(FD);
+
+    return ReturnType + " " + Name + Parameters + ";";
+  }
+
+  std::string GenerateFunctionForwardDeclaration(
+      const FunctionDecl *FD, const std::vector<TypeScope> &Scopes) const {
+    std::string Declaration = GetFunctionSignature(FD);
     std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
 
     return ScopedDeclaration + "\n";
@@ -187,7 +245,7 @@ private:
           GenerateClassForwardDeclaration(RD, Scopes);
       loc = RD->getASTContext().getSourceManager().getLocForStartOfFile(
           RD->getASTContext().getSourceManager().getMainFileID());
-      ForwardDeclarations += ForwardDeclaration;
+      ClassForwardDeclarations += ForwardDeclaration;
       MainFilename = FileName;
       SM = &(RD->getASTContext().getSourceManager());
     }
@@ -202,8 +260,8 @@ private:
     }
   }
 
-  void AddClassUsage(const ValueDecl *VD, const std::string &FileName) {
-    QualType Type = GetBaseType(VD->getType().getUnqualifiedType());
+  void AddClassUsage(const DeclaratorDecl *DD, const std::string &FileName) {
+    QualType Type = GetBaseType(DD->getType().getUnqualifiedType());
 
     auto [Scopes, FullyScopedName] = GetScopes(Type);
     if (!FullyScopedName.empty())
@@ -214,31 +272,53 @@ private:
     if (it == Classes.end())
       llvm::report_fatal_error("Found class usage before definition");
 
-    std::string NewDeclaration =
-        Type.getAsString() + "* " + VD->getNameAsString();
+    std::string NewDeclaration = Type.getAsString() + "* ";
+    std::string Filename = GetContainingFile(DD);
 
-    std::string Filename = GetContainingFile(VD);
-    CharSourceRange Range =
-        CharSourceRange::getTokenRange(VD->getBeginLoc(), VD->getEndLoc());
-    if (!(VD->getType()->isReferenceType() || VD->getType()->isPointerType())) {
+    // See https://youtu.be/_T-5pWQVxeE?feature=shared&t=1766 on how
+    // to get source locations
+    CharSourceRange Range = CharSourceRange::getTokenRange(
+        DD->getTypeSourceInfo()->getTypeLoc().getSourceRange());
+
+    if (!(DD->getType()->isReferenceType() || DD->getType()->isPointerType())) {
       llvm::Error Err = Replace[FileName].add(Replacement(
-          VD->getASTContext().getSourceManager(), Range, NewDeclaration));
+          DD->getASTContext().getSourceManager(), Range, NewDeclaration));
     }
 
     ClassInfo &CI = it->second;
-    CI.Usages.emplace_back(VD->getNameAsString(), Type.getAsString(), Filename,
-                           Type->isReferenceType() || Type->isPointerType(), VD,
+    CI.Usages.emplace_back(DD->getNameAsString(), Type.getAsString(), Filename,
+                           Type->isReferenceType() || Type->isPointerType(), DD,
                            Range);
   }
 
   void AddFunctionInfo(const FunctionDecl *FD, const std::string &FileName,
                        const std::string &ClassName = "") {
+    if (FD->isCXXClassMember())
+      return;
+
     std::string Name = FD->getNameAsString();
 
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
     FullyScopedName += Name;
+
+    bool NeedsWrapper = FunctionNeedsWrapper(FD);
+    if (NeedsWrapper)
+      AddFunctionWrapper(FD, FullyScopedName);
+
+    if (Functions.find(FullyScopedName) == Functions.end()) {
+      std::string ForwardDeclaration =
+          GenerateFunctionForwardDeclaration(FD, Scopes);
+      loc = FD->getASTContext().getSourceManager().getLocForStartOfFile(
+          FD->getASTContext().getSourceManager().getMainFileID());
+
+      // If it needs a wrapper, AddFunctionWrapper will add it
+      if (!NeedsWrapper)
+        FunctionForwardDeclarations += ForwardDeclaration;
+      MainFilename = FileName;
+      SM = &(FD->getASTContext().getSourceManager());
+    }
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(FD->getBeginLoc(), FD->getEndLoc());
@@ -249,6 +329,27 @@ private:
     if (!NewlyInserted) {
       FI->second.HasDefinition |= FD->isDefined();
     }
+  }
+
+  std::string GetWrapperCall(const std::string &WrapperName,
+                             const CallExpr *CE) const {
+    LangOptions LangOpts;
+    PrintingPolicy Policy(LangOpts);
+    Policy.adjustForCPlusPlus();
+
+    std::string ArgsStr;
+    llvm::raw_string_ostream OS(ArgsStr);
+
+    for (const Expr *Arg : CE->arguments()) {
+      if (Arg != CE->getArg(0)) {
+        OS << ", ";
+      }
+      Arg->printPretty(OS, nullptr, Policy, 0);
+    }
+
+    OS.flush();
+
+    return WrapperName + "(" + ArgsStr + ")";
   }
 
   void AddFunctionUsage(const CallExpr *CE) {
@@ -262,6 +363,25 @@ private:
     auto it = Functions.find(FullyScopedName);
     if (it == Functions.end())
       llvm::report_fatal_error("Found function usage before definition");
+
+    if (FunctionNeedsWrapper(FD)) {
+      auto WrapperIt = FunctionWrappers.find(FullyScopedName);
+      if (WrapperIt == FunctionWrappers.end())
+        llvm::report_fatal_error("Function needs wrapper but none found");
+
+      std::string Filename = GetContainingFile(CE);
+
+      CharSourceRange Range =
+          CharSourceRange::getTokenRange(CE->getBeginLoc(), CE->getEndLoc());
+
+      std::string WrapperCall =
+          GetWrapperCall(WrapperIt->second.WrapperName, CE);
+
+      llvm::Error Err = Replace[Filename].add(Replacement(
+          FD->getASTContext().getSourceManager(), Range, WrapperCall));
+      if (Err)
+        llvm::report_fatal_error(std::move(Err));
+    }
 
     FunctionInfo &FI = it->second;
     FI.Usages.emplace_back(FD->getNameAsString());
@@ -396,7 +516,8 @@ int main(int argc, const char **argv) {
 
   Rewrite.overwriteChangedFiles();
 
-  ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(), YM.GetFunctions());
+  // ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(),
+  // YM.GetFunctions());
 
   return result;
 }
