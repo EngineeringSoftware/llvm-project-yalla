@@ -171,6 +171,48 @@ private:
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
   std::unordered_map<std::string, WrapperInfo> MethodWrappers;
 
+  std::string GetParameterType(const QualType &QT) const {
+    QualType CanonicalUnqualifiedType =
+        QT.getCanonicalType().getUnqualifiedType();
+
+    const clang::Type *T;
+    while (!CanonicalUnqualifiedType.isNull()) {
+      T = CanonicalUnqualifiedType.getTypePtr();
+      if (T->isBuiltinType())
+        return CanonicalUnqualifiedType.getAsString();
+
+      if (T->isRecordType()) {
+        break;
+      }
+
+      if (T->isPointerType() || T->isReferenceType()) {
+        // Move to the pointed-to or referred-to type
+        CanonicalUnqualifiedType = T->getPointeeType();
+      }
+    }
+
+    if (!T->isRecordType())
+      llvm::report_fatal_error("Internal error, T must be a record type");
+
+    // We want to keep the original qualifiers
+    std::string OriginalType = QT.getAsString();
+    auto [Scopes, FullyScopedName] = GetScopes(CanonicalUnqualifiedType);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+
+    std::string OriginalTypeName = T->getAsRecordDecl()->getNameAsString();
+    FullyScopedName += OriginalTypeName;
+
+    // If the type already contains the fully scoped name (plus some
+    // qualifiers), return it as is
+    if (OriginalType.find(FullyScopedName) != std::string::npos)
+      return OriginalType;
+
+    std::size_t pos = OriginalType.rfind(OriginalTypeName);
+
+    return OriginalType.replace(pos, OriginalTypeName.size(), FullyScopedName);
+  }
+
   bool FunctionNeedsWrapper(const FunctionDecl *FD) const {
     if (FD->isCXXClassMember())
       return true;
@@ -194,11 +236,17 @@ private:
     if (clang::isa<CXXDestructorDecl>(FD)) {
       WrapperReturnType = "void";
     } else if (clang::isa<CXXConstructorDecl>(FD)) {
-      WrapperReturnType = ClassName + "*";
+      QualType ClassType = dyn_cast<CXXMethodDecl>(FD)
+                               ->getParent()
+                               ->getTypeForDecl()
+                               ->getCanonicalTypeInternal();
+      WrapperReturnType = GetParameterType(ClassType) + "*";
     } else {
-      WrapperReturnType = ReturnType.getAsString();
-      if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
-        WrapperReturnType += "*";
+      WrapperReturnType = GetParameterType(ReturnType);
+      if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl()) {
+        if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
+          WrapperReturnType += "*";
+      }
     }
     std::string WrapperParameters = GetFunctionParameters(FD, ClassName);
 
@@ -233,7 +281,7 @@ private:
     }
 
     for (const auto &Param : FD->parameters()) {
-      Parameters += Param->getType().getAsString();
+      Parameters += GetParameterType(Param->getType());
       Parameters += " ";
       Parameters += Param->getNameAsString();
       Parameters += ", ";
@@ -250,7 +298,7 @@ private:
 
   std::string GetFunctionSignature(const FunctionDecl *FD,
                                    const std::string &ClassName) const {
-    std::string ReturnType = FD->getReturnType().getAsString();
+    std::string ReturnType = GetParameterType(FD->getReturnType());
     std::string Name = FD->getNameAsString();
     std::string Parameters = GetFunctionParameters(FD, ClassName);
 
@@ -331,7 +379,6 @@ private:
         return;
 
       const clang::Expr *Init = VD->getInit();
-      Init->dump();
       if (const CXXConstructExpr *CE = clang::dyn_cast<clang::CXXConstructExpr>(
               Init->IgnoreUnlessSpelledInSource())) {
         // IgnoreUnlessSpelledInSource() is needed for
