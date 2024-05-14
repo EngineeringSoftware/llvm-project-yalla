@@ -64,7 +64,9 @@ DeclarationMatcher FunctionMatcher = anyOf(
     // functionTemplateDecl().bind("FunctionTemplate") // Same info can be
     // retrieved with FunctionDecl
 );
-StatementMatcher FunctionCallMatcher = callExpr().bind("FunctionCall");
+StatementMatcher FunctionCallMatcher =
+    anyOf(callExpr().bind("FunctionCall"),
+          cxxConstructExpr().bind("ConstructorCall"));
 
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
@@ -80,6 +82,8 @@ public:
   }
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
+    SM = &Result.Context->getSourceManager();
+
     if (const RecordDecl *RD =
             Result.Nodes.getNodeAs<clang::RecordDecl>("ClassDeclaration")) {
       std::string FileName = GetContainingFile(RD);
@@ -122,6 +126,14 @@ public:
       if (SourcePaths.find(FileName) != SourcePaths.end())
         AddFunctionUsage(CE);
     }
+
+    if (const CXXConstructExpr *CE =
+            Result.Nodes.getNodeAs<clang::CXXConstructExpr>(
+                "ConstructorCall")) {
+      std::string FileName = GetContainingFile(CE);
+      if (SourcePaths.find(FileName) != SourcePaths.end())
+        AddConstructorUsage(CE);
+    }
   }
 
   void PrintClasses() const {
@@ -157,8 +169,12 @@ private:
   std::string MainFilename;
   SourceManager *SM;
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
+  std::unordered_map<std::string, WrapperInfo> MethodWrappers;
 
   bool FunctionNeedsWrapper(const FunctionDecl *FD) const {
+    if (FD->isCXXClassMember())
+      return true;
+
     QualType ReturnType = FD->getReturnType();
     if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
       return true;
@@ -167,13 +183,24 @@ private:
   }
 
   void AddFunctionWrapper(const FunctionDecl *FD,
-                          const std::string &FullyScopedName) {
+                          const std::string &FullyScopedName,
+                          const std::string &ClassName) {
     QualType ReturnType = FD->getReturnType();
-    const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl();
 
-    std::string WrapperName = "Wrapper_" + FD->getNameAsString();
-    std::string WrapperReturnType = ReturnType.getAsString() + "*";
-    std::string WrapperParameters = GetFunctionParameters(FD);
+    std::string WrapperName = clang::isa<CXXDestructorDecl>(FD)
+                                  ? "Wrapper_" + ClassName + "_destructor"
+                                  : "Wrapper_" + FD->getNameAsString();
+    std::string WrapperReturnType;
+    if (clang::isa<CXXDestructorDecl>(FD)) {
+      WrapperReturnType = "void";
+    } else if (clang::isa<CXXConstructorDecl>(FD)) {
+      WrapperReturnType = ClassName + "*";
+    } else {
+      WrapperReturnType = ReturnType.getAsString();
+      if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
+        WrapperReturnType += "*";
+    }
+    std::string WrapperParameters = GetFunctionParameters(FD, ClassName);
 
     FunctionForwardDeclarations +=
         WrapperReturnType + " " + WrapperName + WrapperParameters + ";\n";
@@ -197,8 +224,14 @@ private:
   }
 
   // Returns the parameters as "(int a, double n, ...)"
-  std::string GetFunctionParameters(const FunctionDecl *FD) const {
+  std::string GetFunctionParameters(const FunctionDecl *FD,
+                                    const std::string &ClassName) const {
     std::string Parameters = "";
+
+    if (FD->isCXXClassMember() && !clang::isa<CXXConstructorDecl>(FD)) {
+      Parameters += ClassName + "* yalla_object, ";
+    }
+
     for (const auto &Param : FD->parameters()) {
       Parameters += Param->getType().getAsString();
       Parameters += " ";
@@ -215,17 +248,20 @@ private:
     return "(" + Parameters + ")";
   }
 
-  std::string GetFunctionSignature(const FunctionDecl *FD) const {
+  std::string GetFunctionSignature(const FunctionDecl *FD,
+                                   const std::string &ClassName) const {
     std::string ReturnType = FD->getReturnType().getAsString();
     std::string Name = FD->getNameAsString();
-    std::string Parameters = GetFunctionParameters(FD);
+    std::string Parameters = GetFunctionParameters(FD, ClassName);
 
     return ReturnType + " " + Name + Parameters + ";";
   }
 
-  std::string GenerateFunctionForwardDeclaration(
-      const FunctionDecl *FD, const std::vector<TypeScope> &Scopes) const {
-    std::string Declaration = GetFunctionSignature(FD);
+  std::string
+  GenerateFunctionForwardDeclaration(const FunctionDecl *FD,
+                                     const std::vector<TypeScope> &Scopes,
+                                     const std::string &ClassName) const {
+    std::string Declaration = GetFunctionSignature(FD, ClassName);
     std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
 
     return ScopedDeclaration + "\n";
@@ -289,13 +325,46 @@ private:
     CI.Usages.emplace_back(DD->getNameAsString(), Type.getAsString(), Filename,
                            Type->isReferenceType() || Type->isPointerType(), DD,
                            Range);
+
+    if (const VarDecl *VD = clang::dyn_cast<clang::VarDecl>(DD)) {
+      if (!VD->hasInit())
+        return;
+
+      const clang::Expr *Init = VD->getInit();
+      Init->dump();
+      if (const CXXConstructExpr *CE = clang::dyn_cast<clang::CXXConstructExpr>(
+              Init->IgnoreUnlessSpelledInSource())) {
+        // IgnoreUnlessSpelledInSource() is needed for
+        // "ClassWithMethod c6 = ClassWithMethod(4);"
+        const FunctionDecl *FD = CE->getConstructor();
+
+        auto [Scopes, FullyScopedName] = GetScopes(FD);
+        if (!FullyScopedName.empty())
+          FullyScopedName += "::";
+        FullyScopedName += FD->getNameAsString();
+
+        auto it = FunctionWrappers.find(FullyScopedName);
+        if (it == FunctionWrappers.end())
+          llvm::report_fatal_error("Found Constructor usage before definition");
+
+        std::string WrapperName = it->second.WrapperName;
+        std::string ReplaceWith = GetWrapperCall(WrapperName, CE);
+
+        // This condition is false if the constructor does not look
+        // like "ClassWithMethod c6 = ClassWithMethod(4);". I'm not
+        // sure why, but the ranges are affected differently.
+        if (!clang::dyn_cast<clang::CXXFunctionalCastExpr>(Init))
+          ReplaceWith = VD->getNameAsString() + " = " + ReplaceWith;
+
+        llvm::Error Err = Replace[FileName].add(Replacement(
+            DD->getASTContext().getSourceManager(),
+            CharSourceRange::getTokenRange(CE->getSourceRange()), ReplaceWith));
+      }
+    }
   }
 
   void AddFunctionInfo(const FunctionDecl *FD, const std::string &FileName,
                        const std::string &ClassName = "") {
-    if (FD->isCXXClassMember())
-      return;
-
     std::string Name = FD->getNameAsString();
 
     auto [Scopes, FullyScopedName] = GetScopes(FD);
@@ -305,15 +374,16 @@ private:
 
     bool NeedsWrapper = FunctionNeedsWrapper(FD);
     if (NeedsWrapper)
-      AddFunctionWrapper(FD, FullyScopedName);
+      AddFunctionWrapper(FD, FullyScopedName, ClassName);
 
     if (Functions.find(FullyScopedName) == Functions.end()) {
       std::string ForwardDeclaration =
-          GenerateFunctionForwardDeclaration(FD, Scopes);
+          GenerateFunctionForwardDeclaration(FD, Scopes, ClassName);
       loc = FD->getASTContext().getSourceManager().getLocForStartOfFile(
           FD->getASTContext().getSourceManager().getMainFileID());
 
-      // If it needs a wrapper, AddFunctionWrapper will add it
+      // If it needs a wrapper, AddFunctionWrapper will add it to the
+      // forward declarations
       if (!NeedsWrapper)
         FunctionForwardDeclarations += ForwardDeclaration;
       MainFilename = FileName;
@@ -333,6 +403,40 @@ private:
 
   std::string GetWrapperCall(const std::string &WrapperName,
                              const CallExpr *CE) const {
+    LangOptions LangOpts;
+    PrintingPolicy Policy(LangOpts);
+    Policy.adjustForCPlusPlus();
+
+    std::string ArgsStr;
+    llvm::raw_string_ostream OS(ArgsStr);
+
+    // If this is a method call, get the name of the object whose
+    // method is being called, e.g. "a0" in "a0.method()".
+    if (const MemberExpr *ME =
+            clang::dyn_cast<MemberExpr>(CE->getCallee()->IgnoreImpCasts())) {
+      Expr *BaseExpr = ME->getBase()->IgnoreImpCasts();
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr)) {
+        ValueDecl *VD = DRE->getDecl();
+        OS << VD->getNameAsString();
+        if (CE->getNumArgs() > 0)
+          OS << ", ";
+      }
+    }
+
+    for (const Expr *Arg : CE->arguments()) {
+      if (Arg != CE->getArg(0)) {
+        OS << ", ";
+      }
+      Arg->printPretty(OS, nullptr, Policy, 0);
+    }
+
+    OS.flush();
+
+    return WrapperName + "(" + ArgsStr + ")";
+  }
+
+  std::string GetWrapperCall(const std::string &WrapperName,
+                             const CXXConstructExpr *CE) const {
     LangOptions LangOpts;
     PrintingPolicy Policy(LangOpts);
     Policy.adjustForCPlusPlus();
@@ -387,6 +491,44 @@ private:
     FI.Usages.emplace_back(FD->getNameAsString());
   }
 
+  void AddConstructorUsage(const CXXConstructExpr *CE) {
+    const CXXConstructorDecl *FD = CE->getConstructor();
+
+    auto [Scopes, FullyScopedName] = GetScopes(FD);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+    FullyScopedName += FD->getNameAsString();
+
+    auto it = Functions.find(FullyScopedName);
+    if (it == Functions.end())
+      llvm::report_fatal_error("Found constructor usage before definition");
+
+    auto WrapperIt = FunctionWrappers.find(FullyScopedName);
+    if (WrapperIt == FunctionWrappers.end())
+      llvm::report_fatal_error("Constructor needs wrapper but none found");
+
+    std::string Filename = GetContainingFile(CE);
+
+    std::string WrapperCall = GetWrapperCall(WrapperIt->second.WrapperName, CE);
+
+    SourceLocation BeginLoc = CE->getBeginLoc();
+    SourceLocation EndLoc = CE->getEndLoc();
+    SourceRange SR = CE->getSourceRange();
+
+    if (BeginLoc == EndLoc) {
+      // Constructor is of the form Kokkos::View V;
+      CharSourceRange Range = CharSourceRange::getTokenRange(BeginLoc, EndLoc);
+
+      // llvm::Error Err = Replace[Filename].add(Replacement(*SM, Range,
+      // WrapperCall)); if (Err)
+      //   llvm::report_fatal_error(std::move(Err));
+    }
+    //  else if (BeginLoc == SR.getBegin()) {
+    // Constructor is of the form Kokkos::View V(4);
+
+    // } else if ()
+  }
+
   std::string GetContainingFile(const Decl *D) const {
     const ASTContext &Context = D->getASTContext();
     // From
@@ -407,6 +549,15 @@ private:
     const SourceManager &SrcMgr = Context.getSourceManager();
     const FileEntry *Entry =
         SrcMgr.getFileEntryForID(SrcMgr.getFileID(CE->getExprLoc()));
+    return Entry->getName().str();
+  }
+
+  std::string GetContainingFile(const CXXConstructExpr *CE) const {
+    // From
+    // https://stackoverflow.com/questions/25075001/how-can-i-get-the-name-of-the-file-im-currently-visiting-with-clang
+    // on how to get source file
+    const FileEntry *Entry =
+        SM->getFileEntryForID(SM->getFileID(CE->getExprLoc()));
     return Entry->getName().str();
   }
 

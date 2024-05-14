@@ -81,15 +81,22 @@ std::string SurroundWithScopes(const std::string &Declaration,
   bool SeenClass = false;
   std::string Start = "";
   std::string End = "";
+
   for (const TypeScope &Scope : Scopes) {
+    if (SeenClass) {
+      llvm::report_fatal_error(
+          "ERROR: scoping with classes unsupported for now\n");
+    }
+
     switch (Scope.Type) {
     case TypeScope::ScopeType::NamespaceScope:
       Start += "namespace " + Scope.Name + " {";
       End += "}";
       break;
     case TypeScope::ScopeType::ClassScope:
-      llvm::report_fatal_error(
-          "ERROR: scoping with classes unsupported for now\n");
+      SeenClass = true;
+      Start += "namespace " + Scope.Name + " {";
+      End += "}";
       break;
     }
   }
