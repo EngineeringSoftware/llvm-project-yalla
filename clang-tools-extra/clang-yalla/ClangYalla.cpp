@@ -194,8 +194,6 @@ private:
   std::string GetParameterType(const QualType &QT) const {
     QualType CurrentQT = QT;
 
-    std::cout << "checking " << QT.getAsString() << '\n';
-
     const clang::Type *T;
     std::string OriginalTypeName = "";
     std::string FullyScopedName = "";
@@ -375,7 +373,15 @@ private:
     std::string TemplateTypenames = "template <";
 
     for (const NamedDecl *ND : *(FTD->getTemplateParameters())) {
-      TemplateTypenames += "typename " + ND->getNameAsString() + ", ";
+      std::string TypenameType;
+      if (const NonTypeTemplateParmDecl *NTTP =
+              dyn_cast<NonTypeTemplateParmDecl>(ND)) {
+        QualType ParamType = NTTP->getType();
+        TypenameType = ParamType.getAsString() + " ";
+      } else {
+        TypenameType = "typename ";
+      }
+      TemplateTypenames += TypenameType + ND->getNameAsString() + ", ";
     }
 
     // Remove the ', '
