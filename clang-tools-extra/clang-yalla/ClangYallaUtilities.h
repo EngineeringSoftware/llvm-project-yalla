@@ -82,6 +82,30 @@ struct FunctionInfo {
   bool IsMethod() const { return ClassName != ""; }
 };
 
+struct TemplatedFunctionInfo {
+  std::string Name;
+  std::string FileName;
+  std::string ClassName;
+  bool HasDefinition;
+  bool IsTemplate;
+  std::vector<TypeScope> Scopes;
+  std::vector<FunctionUsage> Usages;
+  const clang::FunctionTemplateDecl *FTD;
+  clang::CharSourceRange Range;
+
+  TemplatedFunctionInfo(std::string Name, std::string FileName,
+                        std::string ClassName, bool HasDefinition,
+                        bool IsTemplate, std::vector<TypeScope> &&Scopes,
+                        const clang::FunctionTemplateDecl *FTD,
+                        clang::CharSourceRange Range)
+      : Name(std::move(Name)), FileName(std::move(FileName)),
+        ClassName(std::move(ClassName)), HasDefinition(HasDefinition),
+        IsTemplate(IsTemplate), Scopes(std::move(Scopes)), Usages(), FTD(FTD),
+        Range(std::move(Range)) {}
+
+  bool IsMethod() const { return ClassName != ""; }
+};
+
 struct WrapperInfo {
   std::string WrapperName;
   std::string WrapperReturnType;
