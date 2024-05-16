@@ -102,7 +102,6 @@ public:
     if (const FunctionDecl *FD =
             Result.Nodes.getNodeAs<clang::FunctionDecl>("Function")) {
       std::string FileName = GetContainingFile(FD);
-      std::cout << "doing FD " << FD->getNameAsString() << '\n';
       if (FileName == HeaderPath && !isTemplateInstantiation(FD))
         AddFunctionInfo(FD, FileName);
     }
@@ -251,6 +250,11 @@ private:
     if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
       return true;
 
+    for (const ParmVarDecl *PVD : FD->parameters()) {
+      if (PVD->getType()->isRecordType())
+        return true;
+    }
+
     return false;
   }
 
@@ -261,6 +265,16 @@ private:
     QualType ReturnType = FTD->getTemplatedDecl()->getReturnType();
     if (const CXXRecordDecl *FTD = ReturnType->getAsCXXRecordDecl())
       return true;
+
+    for (const ParmVarDecl *PVD : FTD->getTemplatedDecl()->parameters()) {
+      if (PVD->getType()->isRecordType())
+        return true;
+    }
+
+    for (const FunctionDecl *FD : FTD->specializations()) {
+      if (FunctionNeedsWrapper(FD))
+        return true;
+    }
 
     return false;
   }
@@ -289,7 +303,7 @@ private:
           WrapperReturnType += "*";
       }
     }
-    std::string WrapperParameters = GetFunctionParameters(FD, ClassName);
+    std::string WrapperParameters = GetFunctionParameters(FD, ClassName, true);
 
     FunctionForwardDeclarations +=
         WrapperReturnType + " " + WrapperName + WrapperParameters + ";\n";
@@ -311,7 +325,19 @@ private:
         WrapperReturnType += "*";
     }
 
-    std::string WrapperParameters = GetFunctionParameters(FD, "");
+    std::unordered_set<int> ParametersThatCanBeRecordTypes;
+    for (const FunctionDecl *FD : FTD->specializations()) {
+      int current = 0;
+      for (const ParmVarDecl *PVD : FD->parameters()) {
+        if (PVD->getType()->isRecordType()) {
+          ParametersThatCanBeRecordTypes.insert(current);
+        }
+        current++;
+      }
+    }
+
+    std::string WrapperParameters =
+        GetFunctionParameters(FD, "", true, ParametersThatCanBeRecordTypes);
 
     FunctionForwardDeclarations += TemplateTypenames + "\n" +
                                    WrapperReturnType + " " + WrapperName +
@@ -336,19 +362,29 @@ private:
   }
 
   // Returns the parameters as "(int a, double n, ...)"
-  std::string GetFunctionParameters(const FunctionDecl *FD,
-                                    const std::string &ClassName) const {
+  std::string GetFunctionParameters(
+      const FunctionDecl *FD, const std::string &ClassName, bool ForWrapper,
+      const std::unordered_set<int> &ParametersThatCanBeRecordTypes = {})
+      const {
     std::string Parameters = "";
 
     if (FD->isCXXClassMember() && !clang::isa<CXXConstructorDecl>(FD)) {
       Parameters += ClassName + "* yalla_object, ";
     }
 
+    int current = 0;
     for (const auto &Param : FD->parameters()) {
       Parameters += GetParameterType(Param->getType());
+      if ((ForWrapper && Param->getType()->isRecordType()) ||
+          (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
+                             ParametersThatCanBeRecordTypes.end()))
+        Parameters += "*";
+
       Parameters += " ";
       Parameters += Param->getNameAsString();
       Parameters += ", ";
+
+      current++;
     }
 
     // Remove the ', '
@@ -364,7 +400,7 @@ private:
                                    const std::string &ClassName) const {
     std::string ReturnType = GetParameterType(FD->getReturnType());
     std::string Name = FD->getNameAsString();
-    std::string Parameters = GetFunctionParameters(FD, ClassName);
+    std::string Parameters = GetFunctionParameters(FD, ClassName, false);
 
     return ReturnType + " " + Name + Parameters + ";";
   }
@@ -398,7 +434,7 @@ private:
     const FunctionDecl *FD = FTD->getTemplatedDecl();
     std::string ReturnType = GetParameterType(FD->getReturnType());
     std::string Name = FD->getNameAsString();
-    std::string Parameters = GetFunctionParameters(FD, "");
+    std::string Parameters = GetFunctionParameters(FD, "", false);
 
     return TemplateTypenames + "\n" + ReturnType + " " + Name + Parameters +
            ";";
@@ -575,10 +611,10 @@ private:
       std::string ForwardDeclaration =
           GenerateFunctionForwardDeclaration(FTD, Scopes);
 
-      // If it needs a wrapper, AddFunctionWrapper will add it to the
-      // forward declarations
-      if (!NeedsWrapper)
-        FunctionForwardDeclarations += ForwardDeclaration;
+      // For function templates, different instantiations might need
+      // or not need wrappers, so we keep the forward decl of the
+      // function even if it needs a wrapper
+      FunctionForwardDeclarations += ForwardDeclaration;
 
       MainFilename = FileName;
       SM = &(FTD->getASTContext().getSourceManager());
