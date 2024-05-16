@@ -247,7 +247,7 @@ private:
       return true;
 
     QualType ReturnType = FD->getReturnType();
-    if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl())
+    if (const RecordDecl *RD = ReturnType->getAsRecordDecl())
       return true;
 
     for (const ParmVarDecl *PVD : FD->parameters()) {
@@ -263,7 +263,7 @@ private:
       return true;
 
     QualType ReturnType = FTD->getTemplatedDecl()->getReturnType();
-    if (const CXXRecordDecl *FTD = ReturnType->getAsCXXRecordDecl())
+    if (const RecordDecl *FTD = ReturnType->getAsRecordDecl())
       return true;
 
     for (const ParmVarDecl *PVD : FTD->getTemplatedDecl()->parameters()) {
@@ -298,7 +298,7 @@ private:
       WrapperReturnType = GetParameterType(ClassType) + "*";
     } else {
       WrapperReturnType = GetParameterType(ReturnType);
-      if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl()) {
+      if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
           WrapperReturnType += "*";
       }
@@ -320,7 +320,7 @@ private:
     std::string TemplateTypenames = GetTemplateTypenames(FTD);
     std::string WrapperName = "Wrapper_" + FD->getNameAsString();
     std::string WrapperReturnType = GetParameterType(ReturnType);
-    if (const CXXRecordDecl *RD = ReturnType->getAsCXXRecordDecl()) {
+    if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
       if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
         WrapperReturnType += "*";
     }
