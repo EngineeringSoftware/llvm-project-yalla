@@ -40,6 +40,8 @@ using namespace clang::ast_matchers;
 // implicit node that references itself.
 DeclarationMatcher ClassMatcher =
     recordDecl(unless(isImplicit())).bind("ClassDeclaration");
+DeclarationMatcher ClassTemplateMatcher =
+    classTemplateDecl().bind("ClassTemplateDeclaration");
 DeclarationMatcher ClassUsageMatcher = anyOf(
     // fieldDecl(hasType(cxxRecordDecl(isClass()))).bind("Field"),
     // varDecl(hasType(cxxRecordDecl(isClass()))).bind("Variable")
@@ -87,13 +89,30 @@ public:
 
     if (const RecordDecl *RD =
             Result.Nodes.getNodeAs<clang::RecordDecl>("ClassDeclaration")) {
+      if (isTemplatedDeclaration(RD))
+        return;
+
       std::string FileName = GetContainingFile(RD);
       if (FileName == HeaderPath)
         AddClassInfo(RD, FileName);
     }
 
+    if (const ClassTemplateDecl *CTD =
+            Result.Nodes.getNodeAs<clang::ClassTemplateDecl>(
+                "ClassTemplateDeclaration")) {
+      std::string FileName = GetContainingFile(CTD);
+      if (FileName == HeaderPath)
+        AddClassInfo(CTD, FileName);
+    }
+
     if (const CXXMethodDecl *MD =
             Result.Nodes.getNodeAs<clang::CXXMethodDecl>("Method")) {
+      if (MD->isTemplated())
+        return;
+
+      if (MD->isTemplateDecl())
+        return;
+
       std::string FileName = GetContainingFile(MD);
       if (FileName == HeaderPath)
         AddFunctionInfo(MD, FileName, MD->getParent()->getNameAsString());
@@ -180,6 +199,19 @@ private:
   SourceManager *SM;
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
   std::unordered_map<std::string, WrapperInfo> MethodWrappers;
+
+  bool isTemplatedDeclaration(const RecordDecl *RD) const {
+    if (RD->isTemplated())
+      return true;
+
+    if (const CXXRecordDecl *CXXRD = dyn_cast<const CXXRecordDecl>(RD)) {
+      if (CXXRD->getTemplateSpecializationKind() != clang::TSK_Undeclared) {
+        return true;
+      }
+    }
+
+    return false;
+  }
 
   bool isTemplateInstantiation(const FunctionDecl *FD) const {
     if (!FD)
@@ -347,15 +379,16 @@ private:
                                  std::move(WrapperParameters));
   }
 
-  std::string GetClassDeclaration(const RecordDecl *RD) const {
-    return (RD->isStruct() ? "struct " : "class ") + RD->getNameAsString() +
-           ";";
+  std::string GetClassDeclaration(const RecordDecl *RD,
+                                  const std::string &TemplateTypenames) const {
+    return TemplateTypenames + (RD->isStruct() ? "struct " : "class ") +
+           RD->getNameAsString() + ";";
   }
 
-  std::string
-  GenerateClassForwardDeclaration(const RecordDecl *RD,
-                                  const std::vector<TypeScope> &Scopes) const {
-    std::string Declaration = GetClassDeclaration(RD);
+  std::string GenerateClassForwardDeclaration(
+      const RecordDecl *RD, const std::vector<TypeScope> &Scopes,
+      const std::string &TemplateTypenames = "") const {
+    std::string Declaration = GetClassDeclaration(RD, TemplateTypenames);
     std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
 
     return ScopedDeclaration + "\n";
@@ -405,10 +438,10 @@ private:
     return ReturnType + " " + Name + Parameters + ";";
   }
 
-  std::string GetTemplateTypenames(const FunctionTemplateDecl *FTD) const {
+  std::string GetTemplateTypenames(const TemplateDecl *TD) const {
     std::string TemplateTypenames = "template <";
 
-    for (const NamedDecl *ND : *(FTD->getTemplateParameters())) {
+    for (const NamedDecl *ND : *(TD->getTemplateParameters())) {
       std::string TypenameType;
       if (const NonTypeTemplateParmDecl *NTTP =
               dyn_cast<NonTypeTemplateParmDecl>(ND)) {
@@ -471,8 +504,6 @@ private:
     if (Classes.find(FullyScopedName) == Classes.end()) {
       std::string ForwardDeclaration =
           GenerateClassForwardDeclaration(RD, Scopes);
-      loc = RD->getASTContext().getSourceManager().getLocForStartOfFile(
-          RD->getASTContext().getSourceManager().getMainFileID());
       ClassForwardDeclarations += ForwardDeclaration;
       MainFilename = FileName;
       SM = &(RD->getASTContext().getSourceManager());
@@ -483,6 +514,33 @@ private:
     auto [CI, NewlyInserted] =
         Classes.try_emplace(FullyScopedName, Name, FileName, HasDefinition,
                             std::move(Scopes), RD, Range);
+    if (!NewlyInserted) {
+      CI->second.HasDefinition |= HasDefinition;
+    }
+  }
+
+  void AddClassInfo(const ClassTemplateDecl *CTD, const std::string &FileName) {
+    std::string Name = CTD->getNameAsString();
+    bool HasDefinition = CTD->getTemplatedDecl()->getDefinition() != nullptr;
+
+    auto [Scopes, FullyScopedName] = GetScopes(CTD);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+    FullyScopedName += Name;
+
+    if (Classes.find(FullyScopedName) == Classes.end()) {
+      std::string ForwardDeclaration = GenerateClassForwardDeclaration(
+          CTD->getTemplatedDecl(), Scopes, GetTemplateTypenames(CTD) + "\n");
+      ClassForwardDeclarations += ForwardDeclaration;
+      MainFilename = FileName;
+      SM = &(CTD->getASTContext().getSourceManager());
+    }
+
+    CharSourceRange Range =
+        CharSourceRange::getCharRange(CTD->getBeginLoc(), CTD->getEndLoc());
+    auto [CI, NewlyInserted] =
+        Classes.try_emplace(FullyScopedName, Name, FileName, HasDefinition,
+                            std::move(Scopes), CTD->getTemplatedDecl(), Range);
     if (!NewlyInserted) {
       CI->second.HasDefinition |= HasDefinition;
     }
@@ -884,6 +942,7 @@ int main(int argc, const char **argv) {
   YallaMatcher YM(SourcePaths, HeaderAbsolutePath, Tool.getReplacements());
   MatchFinder Finder;
   Finder.addMatcher(ClassMatcher, &YM);
+  Finder.addMatcher(ClassTemplateMatcher, &YM);
   Finder.addMatcher(ClassUsageMatcher, &YM);
   Finder.addMatcher(FunctionMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);
