@@ -12,7 +12,9 @@
 #include "llvm/Support/CommandLine.h"
 
 #include "ClangYallaAnalysis.h"
+#include "ClangYallaGetHeaders.h"
 #include "ClangYallaUtilities.h"
+#include "ClangYallaWrappers.h"
 
 using namespace clang::tooling;
 using namespace llvm;
@@ -208,6 +210,9 @@ public:
   const std::unordered_map<std::string, FunctionInfo> &GetFunctions() const {
     return Functions;
   }
+  const std::unordered_map<std::string, WrapperInfo> &GetWrappers() const {
+    return FunctionWrappers;
+  }
 
 private:
   std::unordered_map<std::string, ClassInfo> Classes;
@@ -222,7 +227,7 @@ private:
   std::string MainFilename;
   SourceManager *SM;
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
-  std::unordered_map<std::string, WrapperInfo> MethodWrappers;
+  const std::string YallaObject = "yalla_object";
 
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
     if (RD->isTemplated())
@@ -366,16 +371,75 @@ private:
     return false;
   }
 
+  std::string GenerateWrapperDefinition(
+      const std::string &Signature, const std::string &ReturnType,
+      const std::string &FunctionName, const std::string &FullyScopedName,
+      const std::string &FullyScopedClassName,
+      WrapperInfo::WrapperType WrapperType,
+      std::vector<std::string> &&WrapperArguments,
+      std::string &&TemplateArguments = "") const {
+    std::string WrapperBody;
+    std::string JoinedArguments = "";
+
+    int index = 0;
+    for (const std::string &Argument : WrapperArguments) {
+      if (index == 0 && WrapperType == WrapperInfo::Method) {
+        index++;
+        continue;
+      }
+      JoinedArguments += Argument + ", ";
+      index++;
+    }
+
+    if (!JoinedArguments.empty()) {
+      JoinedArguments.pop_back();
+      JoinedArguments.pop_back();
+    }
+
+    JoinedArguments = "(" + JoinedArguments + ")";
+
+    switch (WrapperType) {
+    case WrapperInfo::Destructor:
+      WrapperBody = "delete " + WrapperArguments[0] + ";\n";
+      break;
+    case WrapperInfo::Constructor:
+      WrapperBody = "return new " + FullyScopedClassName + TemplateArguments +
+                    JoinedArguments + ";\n";
+      break;
+    case WrapperInfo::Method: {
+      // see
+      // https://stackoverflow.com/questions/610245/where-and-why-do-i-have-to-put-the-template-and-typename-keywords
+      std::string TemplateKeyword;
+      if (TemplateArguments == "")
+        TemplateKeyword = "";
+      else
+        TemplateKeyword = "template ";
+      WrapperBody = "return " + YallaObject + "->" + TemplateKeyword +
+                    FunctionName + TemplateArguments + JoinedArguments + ";\n";
+      break;
+    }
+    case WrapperInfo::Function:
+      WrapperBody = "return " + FullyScopedName + TemplateArguments +
+                    JoinedArguments + ";\n";
+      break;
+    }
+
+    return Signature + "{\n" + WrapperBody + "}\n";
+  }
+
   void AddFunctionWrapper(const FunctionDecl *FD,
                           const std::string &FullyScopedName,
                           const std::string &ClassName,
                           const std::string &FullyScopedClassName) {
     std::string WrapperName;
     std::string WrapperReturnType;
+    WrapperInfo::WrapperType WrapperType;
     if (clang::isa<CXXDestructorDecl>(FD)) {
+      WrapperType = WrapperInfo::Destructor;
       WrapperName = "Wrapper_" + ClassName + "_destructor";
       WrapperReturnType = "void";
     } else if (clang::isa<CXXConstructorDecl>(FD)) {
+      WrapperType = WrapperInfo::Constructor;
       WrapperName = "Wrapper_" + ClassName;
       const clang::Type *T =
           dyn_cast<CXXMethodDecl>(FD)->getParent()->getTypeForDecl();
@@ -383,6 +447,11 @@ private:
       QualType ClassType = T->getCanonicalTypeInternal();
       WrapperReturnType = GetParameterType(ClassType) + "*";
     } else {
+      if (FD->isCXXClassMember())
+        WrapperType = WrapperInfo::Method;
+      else
+        WrapperType = WrapperInfo::Function;
+
       WrapperName = "Wrapper_" + FD->getNameAsString();
       QualType ReturnType = FD->getReturnType();
 
@@ -393,25 +462,34 @@ private:
       }
     }
 
-    std::string WrapperParameters =
+    auto [Parameters, FunctionArguments] =
         GetFunctionParameters(FD, FullyScopedClassName, true);
 
     std::string TemplateTypenames = "";
+    std::string TemplateArguments = "";
     if (FD->isCXXClassMember()) {
       const DeclContext *DC = FD->getDeclContext();
       if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
         const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
-        if (CTD)
+        if (CTD) {
           TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
+          TemplateArguments = GetTemplateTypenames(CTD, false);
+        }
       }
     }
 
-    FunctionForwardDeclarations += TemplateTypenames + WrapperReturnType + " " +
-                                   WrapperName + WrapperParameters + ";\n";
-    FunctionWrappers.try_emplace(FullyScopedName, std::move(WrapperName),
-                                 std::move(WrapperReturnType),
-                                 std::move(WrapperParameters));
+    std::string WrapperFunctionSignature =
+        TemplateTypenames + WrapperReturnType + " " + WrapperName + Parameters;
+    std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
+        WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
+        FullyScopedName, FullyScopedClassName, WrapperType,
+        std::move(FunctionArguments), std::move(TemplateArguments));
+
+    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    FunctionWrappers.try_emplace(
+        FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
+        std::move(Parameters), std::move(WrapperFunctionDefinition));
   }
 
   void AddFunctionWrapper(const FunctionTemplateDecl *FTD,
@@ -419,11 +497,13 @@ private:
                           const std::string &ClassName) {
     const FunctionDecl *FD = FTD->getTemplatedDecl();
     QualType ReturnType = FD->getReturnType();
+    WrapperInfo::WrapperType WrapperType;
 
     std::string TemplateTypenames = GetTemplateTypenames(FTD);
     std::string WrapperName;
     std::string WrapperReturnType;
     if (clang::isa<CXXConstructorDecl>(FD)) {
+      WrapperType = WrapperInfo::Constructor;
       WrapperName = "Wrapper_" + ClassName;
       const clang::Type *T =
           dyn_cast<CXXMethodDecl>(FD)->getParent()->getTypeForDecl();
@@ -431,6 +511,11 @@ private:
       QualType ClassType = T->getCanonicalTypeInternal();
       WrapperReturnType = GetParameterType(ClassType) + "*";
     } else {
+      if (FD->isCXXClassMember())
+        WrapperType = WrapperInfo::Method;
+      else
+        WrapperType = WrapperInfo::Function;
+
       WrapperName = "Wrapper_" + FD->getNameAsString();
       WrapperReturnType = GetParameterType(ReturnType);
 
@@ -451,15 +536,22 @@ private:
       }
     }
 
-    std::string WrapperParameters = GetFunctionParameters(
+    auto [Parameters, FunctionArguments] = GetFunctionParameters(
         FD, ClassName, true, ParametersThatCanBeRecordTypes);
+    std::string TemplateArguments = GetTemplateTypenames(FTD, false);
 
-    FunctionForwardDeclarations += TemplateTypenames + "\n" +
-                                   WrapperReturnType + " " + WrapperName +
-                                   WrapperParameters + ";\n";
-    FunctionWrappers.try_emplace(FullyScopedName, std::move(WrapperName),
-                                 std::move(WrapperReturnType),
-                                 std::move(WrapperParameters));
+    std::string WrapperFunctionSignature = TemplateTypenames + "\n" +
+                                           WrapperReturnType + " " +
+                                           WrapperName + Parameters;
+    std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
+        WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
+        FullyScopedName, ClassName, WrapperType, std::move(FunctionArguments),
+        std::move(TemplateArguments));
+
+    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    FunctionWrappers.try_emplace(
+        FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
+        std::move(Parameters), std::move(WrapperFunctionDefinition));
   }
 
   std::string GetClassDeclaration(const RecordDecl *RD,
@@ -477,12 +569,14 @@ private:
     return ScopedDeclaration + "\n";
   }
 
-  // Returns the parameters as "(int a, double n, ...)"
-  std::string GetFunctionParameters(
+  // Returns the parameters as "(int a, double n, ...)" and the
+  // argument names as ["a", "n", ...]
+  std::pair<std::string, std::vector<std::string>> GetFunctionParameters(
       const FunctionDecl *FD, const std::string &ClassName, bool ForWrapper,
       const std::unordered_set<int> &ParametersThatCanBeRecordTypes = {})
       const {
     std::string Parameters = "";
+    std::vector<std::string> FunctionArguments;
 
     // Add the first argument as yalla_object if FD is a method, while
     // making sure to add template params e.g. <T, U, ...>
@@ -507,7 +601,8 @@ private:
         }
       }
 
-      Parameters += ClassName + TemplateParams + "* yalla_object, ";
+      Parameters += ClassName + TemplateParams + "* " + YallaObject + ", ";
+      FunctionArguments.emplace_back(YallaObject);
     }
 
     int current = 0;
@@ -523,6 +618,8 @@ private:
       Parameters += ", ";
 
       current++;
+
+      FunctionArguments.push_back(Param->getNameAsString());
     }
 
     // Remove the ', '
@@ -531,21 +628,22 @@ private:
       Parameters.pop_back();
     }
 
-    return "(" + Parameters + ")";
+    return {"(" + Parameters + ")", FunctionArguments};
   }
 
   std::string GetFunctionSignature(const FunctionDecl *FD,
                                    const std::string &ClassName) const {
     std::string ReturnType = GetParameterType(FD->getReturnType());
     std::string Name = FD->getNameAsString();
-    std::string Parameters = GetFunctionParameters(FD, ClassName, false);
+    auto [Parameters, FunctionArguments] =
+        GetFunctionParameters(FD, ClassName, false);
 
     return ReturnType + " " + Name + Parameters + ";";
   }
 
   std::string GetTemplateTypenames(const TemplateDecl *TD,
-                                   bool AddTypenames = true) const {
-    std::string TemplateTypenames = AddTypenames ? "template <" : "<";
+                                   bool AsParameters = true) const {
+    std::string TemplateTypenames = AsParameters ? "template <" : "<";
 
     // Check if this is a templated method in a templated class and
     // add the class's template parameters
@@ -559,7 +657,7 @@ private:
           for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
 
             std::string TypenameType;
-            if (AddTypenames) {
+            if (AsParameters) {
               if (const NonTypeTemplateParmDecl *NTTP =
                       dyn_cast<NonTypeTemplateParmDecl>(ND)) {
                 QualType ParamType = NTTP->getType();
@@ -579,7 +677,7 @@ private:
 
     for (const NamedDecl *ND : *(TD->getTemplateParameters())) {
       std::string TypenameType;
-      if (AddTypenames) {
+      if (AsParameters) {
         if (const NonTypeTemplateParmDecl *NTTP =
                 dyn_cast<NonTypeTemplateParmDecl>(ND)) {
           QualType ParamType = NTTP->getType();
@@ -618,7 +716,7 @@ private:
     }
 
     std::string Name = FD->getNameAsString();
-    std::string Parameters = GetFunctionParameters(FD, "", false);
+    auto [Parameters, FunctionArguments] = GetFunctionParameters(FD, "", false);
 
     return TemplateTypenames + "\n" + ReturnType + " " + Name + Parameters +
            ";";
@@ -1261,6 +1359,13 @@ int main(int argc, const char **argv) {
 
   // ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(),
   // YM.GetFunctions());
+
+  ClangTool IncludeTool(OptionsParser.getCompilations(),
+                        OptionsParser.getSourcePathList());
+  auto ActionFactory = newFrontendActionFactory<IncludeFinderAction>();
+  IncludeTool.run(ActionFactory.get());
+
+  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrappers());
 
   return result;
 }

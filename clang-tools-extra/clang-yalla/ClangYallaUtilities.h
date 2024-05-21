@@ -110,12 +110,16 @@ struct WrapperInfo {
   std::string WrapperName;
   std::string WrapperReturnType;
   std::string WrapperParameters; // Of the form "(int a, ...)"
+  std::string WrapperDefinition;
+
+  enum WrapperType { Destructor, Constructor, Method, Function };
 
   WrapperInfo(std::string &&WrapperName, std::string &&WrapperReturnType,
-              std::string &&WrapperParameters)
+              std::string &&WrapperParameters, std::string &&WrapperDefinition)
       : WrapperName(std::move(WrapperName)),
         WrapperReturnType(std::move(WrapperReturnType)),
-        WrapperParameters(std::move(WrapperParameters)) {}
+        WrapperParameters(std::move(WrapperParameters)),
+        WrapperDefinition(std::move(WrapperDefinition)) {}
 };
 
 #endif
