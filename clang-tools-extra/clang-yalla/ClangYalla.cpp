@@ -213,6 +213,14 @@ public:
   const std::unordered_map<std::string, WrapperInfo> &GetWrappers() const {
     return FunctionWrappers;
   }
+  const std::unordered_set<std::string> &
+  GetClassTemplateInstantiations() const {
+    return ClassTemplateInstantiations;
+  }
+  const std::unordered_set<std::string> &
+  GetFunctionTemplateInstantiations() const {
+    return FunctionTemplateInstantiations;
+  }
 
 private:
   std::unordered_map<std::string, ClassInfo> Classes;
@@ -228,6 +236,8 @@ private:
   SourceManager *SM;
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
   const std::string YallaObject = "yalla_object";
+  std::unordered_set<std::string> ClassTemplateInstantiations;
+  std::unordered_set<std::string> FunctionTemplateInstantiations;
 
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
     if (RD->isTemplated())
@@ -414,6 +424,7 @@ private:
         TemplateKeyword = "";
       else
         TemplateKeyword = "template ";
+
       WrapperBody = "return " + YallaObject + "->" + TemplateKeyword +
                     FunctionName + TemplateArguments + JoinedArguments + ";\n";
       break;
@@ -434,6 +445,7 @@ private:
     std::string WrapperName;
     std::string WrapperReturnType;
     WrapperInfo::WrapperType WrapperType;
+
     if (clang::isa<CXXDestructorDecl>(FD)) {
       WrapperType = WrapperInfo::Destructor;
       WrapperName = "Wrapper_" + ClassName + "_destructor";
@@ -462,19 +474,27 @@ private:
       }
     }
 
-    auto [Parameters, FunctionArguments] =
+    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, FullyScopedClassName, true);
 
     std::string TemplateTypenames = "";
     std::string TemplateArguments = "";
+
     if (FD->isCXXClassMember()) {
       const DeclContext *DC = FD->getDeclContext();
+
       if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
         const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
         if (CTD) {
           TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
-          TemplateArguments = GetTemplateTypenames(CTD, false);
+
+          // The template arguments are going to be used to invoke the
+          // function being wrapped. The only situation where we would
+          // want to specify the template argument in the function
+          // call is in the constructor.
+          if (WrapperType == WrapperInfo::Constructor)
+            TemplateArguments = GetTemplateTypenames(CTD, false);
         }
       }
     }
@@ -484,12 +504,13 @@ private:
     std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
         WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
         FullyScopedName, FullyScopedClassName, WrapperType,
-        std::move(FunctionArguments), std::move(TemplateArguments));
+        std::move(FunctionParameters), std::move(TemplateArguments));
 
     FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
-        std::move(Parameters), std::move(WrapperFunctionDefinition));
+        std::move(Parameters), std::move(WrapperFunctionDefinition),
+        std::move(FunctionParameterTypes));
   }
 
   void AddFunctionWrapper(const FunctionTemplateDecl *FTD,
@@ -502,6 +523,8 @@ private:
     std::string TemplateTypenames = GetTemplateTypenames(FTD);
     std::string WrapperName;
     std::string WrapperReturnType;
+    bool AddClassTemplateParams;
+
     if (clang::isa<CXXConstructorDecl>(FD)) {
       WrapperType = WrapperInfo::Constructor;
       WrapperName = "Wrapper_" + ClassName;
@@ -510,6 +533,7 @@ private:
 
       QualType ClassType = T->getCanonicalTypeInternal();
       WrapperReturnType = GetParameterType(ClassType) + "*";
+      AddClassTemplateParams = true;
     } else {
       if (FD->isCXXClassMember())
         WrapperType = WrapperInfo::Method;
@@ -523,6 +547,7 @@ private:
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
           WrapperReturnType += "*";
       }
+      AddClassTemplateParams = false;
     }
 
     std::unordered_set<int> ParametersThatCanBeRecordTypes;
@@ -536,22 +561,25 @@ private:
       }
     }
 
-    auto [Parameters, FunctionArguments] = GetFunctionParameters(
-        FD, ClassName, true, ParametersThatCanBeRecordTypes);
-    std::string TemplateArguments = GetTemplateTypenames(FTD, false);
+    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
+        GetFunctionParameters(FD, ClassName, true,
+                              ParametersThatCanBeRecordTypes);
+    std::string TemplateArguments =
+        GetTemplateTypenames(FTD, false, AddClassTemplateParams);
 
     std::string WrapperFunctionSignature = TemplateTypenames + "\n" +
                                            WrapperReturnType + " " +
                                            WrapperName + Parameters;
     std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
         WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
-        FullyScopedName, ClassName, WrapperType, std::move(FunctionArguments),
+        FullyScopedName, ClassName, WrapperType, std::move(FunctionParameters),
         std::move(TemplateArguments));
 
     FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
-        std::move(Parameters), std::move(WrapperFunctionDefinition));
+        std::move(Parameters), std::move(WrapperFunctionDefinition),
+        std::move(FunctionParameterTypes));
   }
 
   std::string GetClassDeclaration(const RecordDecl *RD,
@@ -571,11 +599,13 @@ private:
 
   // Returns the parameters as "(int a, double n, ...)" and the
   // argument names as ["a", "n", ...]
-  std::pair<std::string, std::vector<std::string>> GetFunctionParameters(
-      const FunctionDecl *FD, const std::string &ClassName, bool ForWrapper,
-      const std::unordered_set<int> &ParametersThatCanBeRecordTypes = {})
-      const {
+  std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
+  GetFunctionParameters(const FunctionDecl *FD, const std::string &ClassName,
+                        bool ForWrapper,
+                        const std::unordered_set<int>
+                            &ParametersThatCanBeRecordTypes = {}) const {
     std::string Parameters = "";
+    std::vector<std::string> FunctionArgumentTypes;
     std::vector<std::string> FunctionArguments;
 
     // Add the first argument as yalla_object if FD is a method, while
@@ -603,15 +633,18 @@ private:
 
       Parameters += ClassName + TemplateParams + "* " + YallaObject + ", ";
       FunctionArguments.emplace_back(YallaObject);
+      FunctionArgumentTypes.emplace_back(ClassName);
     }
 
     int current = 0;
     for (const auto &Param : FD->parameters()) {
-      Parameters += GetParameterType(Param->getType());
+      std::string ParamType = GetParameterType(Param->getType());
       if ((ForWrapper && Param->getType()->isRecordType()) ||
           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
                              ParametersThatCanBeRecordTypes.end()))
-        Parameters += "*";
+        ParamType += "*";
+
+      Parameters += ParamType;
 
       Parameters += " ";
       Parameters += Param->getNameAsString();
@@ -620,6 +653,7 @@ private:
       current++;
 
       FunctionArguments.push_back(Param->getNameAsString());
+      FunctionArgumentTypes.emplace_back(ParamType);
     }
 
     // Remove the ', '
@@ -628,48 +662,52 @@ private:
       Parameters.pop_back();
     }
 
-    return {"(" + Parameters + ")", FunctionArguments};
+    return {"(" + Parameters + ")", FunctionArguments, FunctionArgumentTypes};
   }
 
   std::string GetFunctionSignature(const FunctionDecl *FD,
                                    const std::string &ClassName) const {
     std::string ReturnType = GetParameterType(FD->getReturnType());
     std::string Name = FD->getNameAsString();
-    auto [Parameters, FunctionArguments] =
+    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, ClassName, false);
 
     return ReturnType + " " + Name + Parameters + ";";
   }
 
   std::string GetTemplateTypenames(const TemplateDecl *TD,
-                                   bool AsParameters = true) const {
+                                   bool AsParameters = true,
+                                   bool AddClassTemplateParams = true) const {
     std::string TemplateTypenames = AsParameters ? "template <" : "<";
 
     // Check if this is a templated method in a templated class and
     // add the class's template parameters
-    if (const FunctionTemplateDecl *FTD = dyn_cast<FunctionTemplateDecl>(TD)) {
-      const DeclContext *DC = FTD->getDeclContext();
+    if (AddClassTemplateParams) {
+      if (const FunctionTemplateDecl *FTD =
+              dyn_cast<FunctionTemplateDecl>(TD)) {
+        const DeclContext *DC = FTD->getDeclContext();
 
-      if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-        const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+          const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
-        if (CTD) {
-          for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
+          if (CTD) {
+            for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
 
-            std::string TypenameType;
-            if (AsParameters) {
-              if (const NonTypeTemplateParmDecl *NTTP =
-                      dyn_cast<NonTypeTemplateParmDecl>(ND)) {
-                QualType ParamType = NTTP->getType();
-                TypenameType = ParamType.getAsString() + " ";
+              std::string TypenameType;
+              if (AsParameters) {
+                if (const NonTypeTemplateParmDecl *NTTP =
+                        dyn_cast<NonTypeTemplateParmDecl>(ND)) {
+                  QualType ParamType = NTTP->getType();
+                  TypenameType = ParamType.getAsString() + " ";
+                } else {
+                  TypenameType = "typename ";
+                }
               } else {
-                TypenameType = "typename ";
+                TypenameType = "";
               }
-            } else {
-              TypenameType = "";
-            }
 
-            TemplateTypenames += TypenameType + ND->getNameAsString() + ", ";
+              TemplateTypenames += TypenameType + ND->getNameAsString() + ", ";
+            }
           }
         }
       }
@@ -700,8 +738,16 @@ private:
     return TemplateTypenames;
   }
 
-  std::string GetFunctionSignature(const FunctionTemplateDecl *FTD) const {
-    std::string TemplateTypenames = GetTemplateTypenames(FTD);
+  std::string GetFunctionSignature(const FunctionTemplateDecl *FTD,
+                                   const std::string &TemplateArguments) const {
+    // std::string TemplateTypenames = GetTemplateTypenames(FTD);
+    std::string TemplateTypenames;
+    if (TemplateArguments == "")
+      TemplateTypenames = GetTemplateTypenames(FTD);
+    else
+      TemplateTypenames = "template ";
+
+    // std::string TemplateTypenames = GetTemplateTypenames(FTD);
     const FunctionDecl *FD = FTD->getTemplatedDecl();
     std::string ReturnType;
 
@@ -716,10 +762,11 @@ private:
     }
 
     std::string Name = FD->getNameAsString();
-    auto [Parameters, FunctionArguments] = GetFunctionParameters(FD, "", false);
+    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
+        GetFunctionParameters(FD, "", false);
 
-    return TemplateTypenames + "\n" + ReturnType + " " + Name + Parameters +
-           ";";
+    return TemplateTypenames + "\n" + ReturnType + " " + Name +
+           TemplateArguments + Parameters + ";";
   }
 
   std::string
@@ -733,9 +780,9 @@ private:
   }
 
   std::string GenerateFunctionForwardDeclaration(
-      const FunctionTemplateDecl *FTD,
-      const std::vector<TypeScope> &Scopes) const {
-    std::string Declaration = GetFunctionSignature(FTD);
+      const FunctionTemplateDecl *FTD, const std::vector<TypeScope> &Scopes,
+      const std::string &TemplateArguments = "") const {
+    std::string Declaration = GetFunctionSignature(FTD, TemplateArguments);
     std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
 
     return ScopedDeclaration + "\n";
@@ -799,8 +846,10 @@ private:
     }
   }
 
-  std::string GetWrapperTemplateArgs(const CallExpr *CE) const {
+  std::pair<std::string, std::unordered_map<std::string, std::string>>
+  GetWrapperTemplateArgs(const CallExpr *CE) const {
     std::string result = "";
+    std::unordered_map<std::string, std::string> TemplateParameterToArgument;
 
     const FunctionDecl *FD = CE->getDirectCallee();
     const DeclContext *DC = FD->getParent();
@@ -808,36 +857,53 @@ private:
     if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
       if (const ClassTemplateSpecializationDecl *CTSD =
               dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
-        std::string ClassTemplateArgs = GetTemplateArgs(CTSD);
-        result = GetTemplateArgs(CTSD).substr(1, ClassTemplateArgs.size() - 2) +
+        auto [ClassTemplateArgs, ClassTemplateParamMap] = GetTemplateArgs(CTSD);
+        result = ClassTemplateArgs.substr(1, ClassTemplateArgs.size() - 2) +
                  ", "; // remove the < and >
+        TemplateParameterToArgument.insert(ClassTemplateParamMap.begin(),
+                                           ClassTemplateParamMap.end());
       }
     }
 
     const FunctionTemplateSpecializationInfo *FTSI =
         FD->getTemplateSpecializationInfo();
     if (FTSI) {
-      for (const clang::TemplateArgument &arg :
-           FTSI->TemplateArguments->asArray()) {
-        switch (arg.getKind()) {
-        case clang::TemplateArgument::Type:
-          result += arg.getAsType().getAsString();
-          break;
-        case clang::TemplateArgument::Integral:
-          result += llvm::toString(arg.getAsIntegral(), 10);
-          break;
-        case clang::TemplateArgument::Declaration:
-          result += arg.getAsDecl()->getNameAsString();
-          break;
-        case clang::TemplateArgument::NullPtr:
-          result += "nullptr";
-          break;
-        // Additional cases as necessary
-        default:
-          llvm::report_fatal_error("Unknown template arg");
+      auto [FunctionTemplateArgs, FunctionTemplateParamMap] =
+          GetTemplateArgs(FTSI);
+      result +=
+          FunctionTemplateArgs.substr(1, FunctionTemplateArgs.size() - 2) +
+          ", "; // remove the < and >
+
+      for (const auto &[param, arg] : FunctionTemplateParamMap) {
+        auto It = TemplateParameterToArgument.find(param);
+        if (It != TemplateParameterToArgument.end()) {
+          if (It->second != arg)
+            llvm::report_fatal_error("Attempted redefinition of parameter "
+                                     "between class and function");
         }
-        result += ", ";
       }
+
+      // for (const clang::TemplateArgument &arg :
+      //      FTSI->TemplateArguments->asArray()) {
+      //   switch (arg.getKind()) {
+      //   case clang::TemplateArgument::Type:
+      //     result += arg.getAsType().getAsString();
+      //     break;
+      //   case clang::TemplateArgument::Integral:
+      //     result += llvm::toString(arg.getAsIntegral(), 10);
+      //     break;
+      //   case clang::TemplateArgument::Declaration:
+      //     result += arg.getAsDecl()->getNameAsString();
+      //     break;
+      //   case clang::TemplateArgument::NullPtr:
+      //     result += "nullptr";
+      //     break;
+      //   // Additional cases as necessary
+      //   default:
+      //     llvm::report_fatal_error("Unknown template arg");
+      //   }
+      //   result += ", ";
+      // }
     }
 
     if (result.size() != 0) {
@@ -847,32 +913,52 @@ private:
       result = "<" + result + ">";
     }
 
-    return result;
+    return {result, TemplateParameterToArgument};
   }
 
-  std::string
+  std::pair<std::string, std::unordered_map<std::string, std::string>>
   GetTemplateArgs(const ClassTemplateSpecializationDecl *CTSD) const {
     std::string result = "";
-    for (const clang::TemplateArgument &arg :
-         CTSD->getTemplateArgs().asArray()) {
+    std::unordered_map<std::string, std::string> ClassParameterToArgument;
+    const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate();
+
+    const TemplateArgumentList &TemplateArgs = CTSD->getTemplateArgs();
+    const TemplateParameterList *TemplateParams = CTD->getTemplateParameters();
+
+    if (TemplateArgs.size() != TemplateParams->size())
+      llvm::report_fatal_error(
+          "Mismatch in number of template arguments and parameters");
+
+    for (unsigned i = 0; i < TemplateArgs.size(); i++) {
+      const TemplateArgument &arg = TemplateArgs[i];
+      const NamedDecl *param = TemplateParams->getParam(i);
+      std::string ArgValue;
+
       switch (arg.getKind()) {
       case clang::TemplateArgument::Type:
-        result += arg.getAsType().getAsString();
+        ArgValue = arg.getAsType().getAsString();
         break;
       case clang::TemplateArgument::Integral:
-        result += llvm::toString(arg.getAsIntegral(), 10);
+        ArgValue = llvm::toString(arg.getAsIntegral(), 10);
         break;
       case clang::TemplateArgument::Declaration:
-        result += arg.getAsDecl()->getNameAsString();
+        ArgValue = arg.getAsDecl()->getNameAsString();
         break;
       case clang::TemplateArgument::NullPtr:
-        result += "nullptr";
+        ArgValue = "nullptr";
         break;
       // Additional cases as necessary
       default:
         llvm::report_fatal_error("Unknown template arg");
       }
-      result += ", ";
+
+      result += ArgValue + ", ";
+      auto [It, NewlyInserted] = ClassParameterToArgument.try_emplace(
+          param->getNameAsString(), ArgValue);
+      if (!NewlyInserted) {
+        if (It->second != ArgValue)
+          llvm::report_fatal_error("Attempted redefinition of parameter");
+      }
     }
 
     if (result.size() != 0) {
@@ -882,7 +968,62 @@ private:
       result = "<" + result + ">";
     }
 
-    return result;
+    return {result, ClassParameterToArgument};
+  }
+
+  std::pair<std::string, std::unordered_map<std::string, std::string>>
+  GetTemplateArgs(const FunctionTemplateSpecializationInfo *FTSI) const {
+    std::string result = "";
+    std::unordered_map<std::string, std::string> FunctionParameterToArgument;
+    const FunctionTemplateDecl *FTD = FTSI->getTemplate();
+
+    const TemplateArgumentList *TemplateArgs = FTSI->TemplateArguments;
+    const TemplateParameterList *TemplateParams = FTD->getTemplateParameters();
+
+    if (TemplateArgs->size() != TemplateParams->size())
+      llvm::report_fatal_error(
+          "Mismatch in number of template arguments and parameters");
+
+    for (unsigned i = 0; i < TemplateArgs->size(); i++) {
+      const TemplateArgument &arg = TemplateArgs->get(i);
+      const NamedDecl *param = TemplateParams->getParam(i);
+      std::string ArgValue;
+
+      switch (arg.getKind()) {
+      case clang::TemplateArgument::Type:
+        ArgValue = arg.getAsType().getAsString();
+        break;
+      case clang::TemplateArgument::Integral:
+        ArgValue = llvm::toString(arg.getAsIntegral(), 10);
+        break;
+      case clang::TemplateArgument::Declaration:
+        ArgValue = arg.getAsDecl()->getNameAsString();
+        break;
+      case clang::TemplateArgument::NullPtr:
+        ArgValue = "nullptr";
+        break;
+      // Additional cases as necessary
+      default:
+        llvm::report_fatal_error("Unknown template arg");
+      }
+
+      result += ArgValue + ", ";
+      auto [It, NewlyInserted] = FunctionParameterToArgument.try_emplace(
+          param->getNameAsString(), ArgValue);
+      if (!NewlyInserted) {
+        if (It->second != ArgValue)
+          llvm::report_fatal_error("Attempted redefinition of parameter");
+      }
+    }
+
+    if (result.size() != 0) {
+      result.pop_back();
+      result.pop_back();
+
+      result = "<" + result + ">";
+    }
+
+    return {result, FunctionParameterToArgument};
   }
 
   void AddClassUsage(const DeclaratorDecl *DD, const std::string &FileName) {
@@ -935,7 +1076,8 @@ private:
                      dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
           TypenameSuffix =
               GetTemplateTypenames(CTSD->getSpecializedTemplate(), false);
-          TemplateArgs = GetTemplateArgs(CTSD);
+          auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
+          TemplateArgs = ClassTemplateArgs;
         }
 
         // IgnoreUnlessSpelledInSource() is needed for
@@ -959,7 +1101,35 @@ private:
           llvm::report_fatal_error("Found Constructor usage before definition");
 
         std::string WrapperName = it->second.WrapperName;
-        std::string ReplaceWith = GetWrapperCall(WrapperName, CE, TemplateArgs);
+        auto [ReplaceWith, WrapperArgumentTypes] =
+            GetWrapperCall(WrapperName, CE, TemplateArgs);
+
+        // Need to replace the template parameters in the return type
+        // with the arguments it is being instantiated with
+        std::string ClassTemplateArgs = "";
+        if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
+          if (const auto *RT = TST->getAs<RecordType>()) {
+            if (const auto *CTSD =
+                    dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
+              // Still need to add scoping stuff
+              auto ArgsMapPair = GetTemplateArgs(CTSD);
+              ClassTemplateArgs = std::get<0>(ArgsMapPair);
+            }
+          }
+        }
+
+        std::string InstantiationReturnType = it->second.WrapperReturnType;
+        size_t ReplaceStart = InstantiationReturnType.find('<');
+        size_t ReplaceEnd = InstantiationReturnType.rfind('>');
+
+        InstantiationReturnType.replace(ReplaceStart, ReplaceEnd,
+                                        ClassTemplateArgs);
+        if (!(*InstantiationReturnType.end() == '*'))
+          InstantiationReturnType += "*";
+
+        FunctionTemplateInstantiations.insert(
+            "template " + InstantiationReturnType + " " + WrapperName +
+            TemplateArgs + "(" + WrapperArgumentTypes + ");\n");
 
         // This condition is false if the constructor does not look
         // like "ClassWithMethod c6 = ClassWithMethod(4);". I'm not
@@ -970,6 +1140,19 @@ private:
         llvm::Error Err = Replace[FileName].add(Replacement(
             DD->getASTContext().getSourceManager(),
             CharSourceRange::getTokenRange(CE->getSourceRange()), ReplaceWith));
+      }
+    }
+
+    // Now add an instantiation if this is a templated class
+    if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
+      if (const auto *RT = TST->getAs<RecordType>()) {
+        if (const auto *CTSD =
+                dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
+          // Still need to add scoping stuff
+          auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
+          ClassTemplateInstantiations.insert(
+              "template class " + FullyScopedName + ClassTemplateArgs + ";\n");
+        }
       }
     }
   }
@@ -1057,60 +1240,136 @@ private:
     }
   }
 
-  std::string GetWrapperCall(const std::string &WrapperName, const CallExpr *CE,
-                             const std::string &TemplateArgs = "") const {
+  std::pair<std::string, std::string>
+  GetWrapperCall(const std::string &WrapperName, const CallExpr *CE,
+                 const std::string &TemplateArgs = "") const {
     LangOptions LangOpts;
     PrintingPolicy Policy(LangOpts);
     Policy.adjustForCPlusPlus();
 
     std::string ArgsStr;
-    llvm::raw_string_ostream OS(ArgsStr);
+    std::string ArgTypesStr; // needed for explicit template instantiation later
+
+    llvm::raw_string_ostream CallOS(ArgsStr);
+    llvm::raw_string_ostream TypesOS(ArgTypesStr);
 
     // If this is a method call, get the name of the object whose
     // method is being called, e.g. "a0" in "a0.method()".
     if (const MemberExpr *ME =
             clang::dyn_cast<MemberExpr>(CE->getCallee()->IgnoreImpCasts())) {
       Expr *BaseExpr = ME->getBase()->IgnoreImpCasts();
+
       if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr)) {
         ValueDecl *VD = DRE->getDecl();
-        OS << VD->getNameAsString();
-        if (CE->getNumArgs() > 0)
-          OS << ", ";
+        CallOS << VD->getNameAsString();
+        TypesOS << BaseExpr->getType().getAsString() + "*";
+
+        if (CE->getNumArgs() > 0) {
+          CallOS << ", ";
+          TypesOS << ", ";
+        }
       }
     }
 
     for (const Expr *Arg : CE->arguments()) {
       if (Arg != CE->getArg(0)) {
-        OS << ", ";
+        CallOS << ", ";
+        TypesOS << ", ";
       }
-      Arg->printPretty(OS, nullptr, Policy, 0);
+      Arg->printPretty(CallOS, nullptr, Policy, 0);
+      TypesOS << Arg->getType().getAsString();
     }
 
-    OS.flush();
+    CallOS.flush();
+    TypesOS.flush();
 
-    return WrapperName + TemplateArgs + "(" + ArgsStr + ")";
+    std::string WrapperCall = WrapperName + TemplateArgs + "(" + ArgsStr + ")";
+
+    return {WrapperCall, ArgTypesStr};
   }
 
-  std::string GetWrapperCall(const std::string &WrapperName,
-                             const CXXConstructExpr *CE,
-                             const std::string &TemplateArgs = "") const {
+  std::pair<std::string, std::string>
+  GetWrapperCall(const std::string &WrapperName, const CXXConstructExpr *CE,
+                 const std::string &TemplateArgs = "") const {
     LangOptions LangOpts;
     PrintingPolicy Policy(LangOpts);
     Policy.adjustForCPlusPlus();
 
     std::string ArgsStr;
-    llvm::raw_string_ostream OS(ArgsStr);
+    std::string ArgTypesStr; // needed for explicit template instantiation later
+
+    llvm::raw_string_ostream CallOS(ArgsStr);
+    llvm::raw_string_ostream TypesOS(ArgTypesStr);
 
     for (const Expr *Arg : CE->arguments()) {
       if (Arg != CE->getArg(0)) {
-        OS << ", ";
+        CallOS << ", ";
+        TypesOS << ", ";
       }
-      Arg->printPretty(OS, nullptr, Policy, 0);
+      Arg->printPretty(CallOS, nullptr, Policy, 0);
+      TypesOS << Arg->getType().getAsString();
     }
 
-    OS.flush();
+    CallOS.flush();
+    TypesOS.flush();
 
-    return WrapperName + TemplateArgs + "(" + ArgsStr + ")";
+    std::string WrapperCall = WrapperName + TemplateArgs + "(" + ArgsStr + ")";
+
+    return {WrapperCall, ArgTypesStr};
+  }
+
+  std::string InstantiateTemplateParameter(
+      const std::string &ParamType,
+      const std::unordered_map<std::string, std::string>
+          &TemplateParameterToArgument) const {
+    auto It = TemplateParameterToArgument.find(ParamType);
+    std::string Instantiation;
+
+    if (It != TemplateParameterToArgument.end()) {
+      // Exact match to template parameter
+      Instantiation = It->second;
+    } else if (ParamType.find("<") != std::string::npos) {
+      // Something similar to TemplatedClass<T>
+
+    } else {
+      // Not templated
+      Instantiation = ParamType;
+    }
+
+    return Instantiation;
+  }
+
+  std::string GetTemplatedWrapperInstantiation(
+      const WrapperInfo &WI, const std::string &WrapperTemplateArgs,
+      const std::string &WrapperArgumentTypes,
+      const std::unordered_map<std::string, std::string>
+          &TemplateParameterToArgument) const {
+    std::string WrapperInstantiation =
+        "template " + WI.WrapperName + WrapperTemplateArgs + "(";
+    std::string WrapperParameters = "";
+
+    for (const std::string &ParamType : WI.WrapperParameterTypes) {
+      auto It = TemplateParameterToArgument.find(ParamType);
+
+      if (It != TemplateParameterToArgument.end()) {
+        // Exact match to template parameter
+        WrapperParameters += It->second;
+      } else if (ParamType.find("<") != std::string::npos) {
+        // Something similar to TemplatedClass<T>
+
+      } else {
+        WrapperParameters += ParamType;
+      }
+
+      WrapperParameters += ", ";
+    }
+
+    if (!WrapperParameters.empty()) {
+      WrapperParameters.pop_back();
+      WrapperParameters.pop_back();
+    }
+
+    WrapperInstantiation += WrapperParameters + ");\n";
   }
 
   void AddFunctionUsage(const CallExpr *CE) {
@@ -1134,15 +1393,30 @@ private:
       if (WrapperIt == FunctionWrappers.end())
         llvm::report_fatal_error("Function needs wrapper but none found");
 
+      const WrapperInfo &WI = WrapperIt->second;
       std::string Filename = GetContainingFile(CE);
 
-      std::string WrapperTemplateArgs = GetWrapperTemplateArgs(CE);
+      auto [WrapperTemplateArgs, TemplateParameterToArgument] =
+          GetWrapperTemplateArgs(CE);
 
       CharSourceRange Range =
           CharSourceRange::getTokenRange(CE->getBeginLoc(), CE->getEndLoc());
 
-      std::string WrapperCall = GetWrapperCall(WrapperIt->second.WrapperName,
-                                               CE, WrapperTemplateArgs);
+      auto [WrapperCall, WrapperArgumentTypes] =
+          GetWrapperCall(WI.WrapperName, CE, WrapperTemplateArgs);
+
+      if (WrapperTemplateArgs != "") {
+        // std::string WrapperInstantiation = "template " + WI.WrapperName +
+        // WrapperTemplateArgs + "(";
+        FunctionTemplateInstantiations.insert(
+            "template " + WI.WrapperReturnType + " " + WI.WrapperName +
+            WrapperTemplateArgs + "(" + WrapperArgumentTypes + ");\n");
+        // FunctionTemplateInstantiations +=
+        // GetTemplatedWrapperInstantiation(WrapperIt->second,
+        // WrapperTemplateArgs, WrapperArgumentTypes,
+        // TemplateParameterToArgument);
+      }
+
       llvm::Error Err = Replace[Filename].add(Replacement(
           FD->getASTContext().getSourceManager(), Range, WrapperCall));
       if (Err)
@@ -1154,6 +1428,24 @@ private:
             ? TemplatedFunctions.find(FullyScopedName)->second.Usages
             : Functions.find(FullyScopedName)->second.Usages;
     Usages.emplace_back(FD->getNameAsString());
+
+    if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+      const FunctionTemplateSpecializationInfo *FTSI =
+          FD->getTemplateSpecializationInfo();
+      const FunctionTemplateDecl *FTD = FD->getDescribedFunctionTemplate();
+
+      if (!FTSI)
+        llvm::report_fatal_error("Could not get function specialization info "
+                                 "for explicit instantiation");
+
+      if (!FTD)
+        llvm::report_fatal_error(
+            "Could not get function template decl for explicit instantiation");
+
+      auto [FunctionTemplateArgs, TemplateParameterMap] = GetTemplateArgs(FTSI);
+      FunctionTemplateInstantiations.insert(GenerateFunctionForwardDeclaration(
+          FTD, Scopes, FunctionTemplateArgs));
+    }
   }
 
   void AddConstructorUsage(const CXXConstructExpr *CE) {
@@ -1194,7 +1486,8 @@ private:
 
     std::string Filename = GetContainingFile(CE);
 
-    std::string WrapperCall = GetWrapperCall(WrapperIt->second.WrapperName, CE);
+    auto [WrapperCall, WrapperArgumentTypes] =
+        GetWrapperCall(WrapperIt->second.WrapperName, CE);
 
     SourceLocation BeginLoc = CE->getBeginLoc();
     SourceLocation EndLoc = CE->getEndLoc();
@@ -1365,7 +1658,9 @@ int main(int argc, const char **argv) {
   auto ActionFactory = newFrontendActionFactory<IncludeFinderAction>();
   IncludeTool.run(ActionFactory.get());
 
-  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrappers());
+  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrappers(),
+                    YM.GetClassTemplateInstantiations(),
+                    YM.GetFunctionTemplateInstantiations());
 
   return result;
 }
