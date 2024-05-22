@@ -33,7 +33,12 @@ static cl::extrahelp MoreHelp("\nMore help text...\n");
 
 static llvm::cl::opt<std::string>
     HeaderCLI("header", llvm::cl::desc("The header to be substituted"),
-              llvm::cl::value_desc("PATH_TO_HEADER"), llvm::cl::Required);
+              llvm::cl::value_desc("PATH_TO_HEADER"), llvm::cl::Optional);
+
+static llvm::cl::opt<std::string> HeaderDirectoryCLI(
+    "header_dir",
+    llvm::cl::desc("The directory containing the headers to be substituted"),
+    llvm::cl::value_desc("PATH_TO_HEADER_DIR"), llvm::cl::Optional);
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -77,8 +82,10 @@ class YallaMatcher : public MatchFinder::MatchCallback {
 public:
   YallaMatcher(const std::unordered_set<std::string> &SourcePaths,
                const std::string &HeaderPath,
+               const std::string &HeaderDirectoryPath,
                std::map<std::string, Replacements> &Replace)
-      : SourcePaths(SourcePaths), HeaderPath(HeaderPath), Replace(Replace) {}
+      : SourcePaths(SourcePaths), HeaderPath(HeaderPath),
+        HeaderDirectoryPath(HeaderDirectoryPath), Replace(Replace) {}
 
   virtual void onEndOfTranslationUnit() override {
     if (ClassForwardDeclarations != "" || FunctionForwardDeclarations != "") {
@@ -96,7 +103,7 @@ public:
         return;
 
       std::string FileName = GetContainingFile(RD);
-      if (FileName == HeaderPath)
+      if (inSubstitutedHeader(FileName))
         AddClassInfo(RD, FileName);
     }
 
@@ -104,7 +111,7 @@ public:
             Result.Nodes.getNodeAs<clang::ClassTemplateDecl>(
                 "ClassTemplateDeclaration")) {
       std::string FileName = GetContainingFile(CTD);
-      if (FileName == HeaderPath)
+      if (inSubstitutedHeader(FileName))
         AddClassInfo(CTD, FileName);
     }
 
@@ -117,7 +124,7 @@ public:
         return;
 
       std::string FileName = GetContainingFile(MD);
-      if (FileName == HeaderPath) {
+      if (inSubstitutedHeader(FileName)) {
         std::string ClassName = MD->getParent()->getNameAsString();
         auto [Scopes, FullyScopedClassName] = GetScopes(MD->getParent());
         if (!FullyScopedClassName.empty())
@@ -130,7 +137,7 @@ public:
     if (const FunctionDecl *FD =
             Result.Nodes.getNodeAs<clang::FunctionDecl>("Function")) {
       std::string FileName = GetContainingFile(FD);
-      if (FileName == HeaderPath && !isTemplateInstantiation(FD))
+      if (inSubstitutedHeader(FileName) && !isTemplateInstantiation(FD))
         AddFunctionInfo(FD, FileName);
     }
 
@@ -149,7 +156,7 @@ public:
         ClassName = "";
       }
 
-      if (FileName == HeaderPath)
+      if (inSubstitutedHeader(FileName))
         AddFunctionInfo(FTD, FileName, ClassName);
     }
 
@@ -228,6 +235,7 @@ private:
   std::unordered_map<std::string, TemplatedFunctionInfo> TemplatedFunctions;
   const std::unordered_set<std::string> &SourcePaths;
   const std::string &HeaderPath;
+  const std::string &HeaderDirectoryPath;
   std::map<std::string, Replacements> &Replace;
   std::string ClassForwardDeclarations = "";
   std::string FunctionForwardDeclarations = "";
@@ -239,6 +247,13 @@ private:
   std::unordered_set<std::string> ClassTemplateInstantiations;
   std::unordered_set<std::string> FunctionTemplateInstantiations;
   std::unordered_set<std::string> WrapperFunctionDefinitions;
+
+  bool inSubstitutedHeader(const std::string &Filename) const {
+    if (HeaderDirectoryPath == "")
+      return Filename == HeaderPath;
+
+    return Filename.find(HeaderDirectoryPath) != std::string::npos;
+  }
 
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
     if (RD->isTemplated())
@@ -1536,18 +1551,26 @@ private:
     const SourceManager &SrcMgr = Context.getSourceManager();
     const FileEntry *Entry =
         SrcMgr.getFileEntryForID(SrcMgr.getFileID(D->getLocation()));
+
+    if (!Entry)
+      return "";
     return Entry->getName().str();
   }
 
   std::string GetContainingFile(const CallExpr *CE) const {
-    const ASTContext &Context =
-        CE->getDirectCallee()->getDeclContext()->getParentASTContext();
+    const FunctionDecl *FD = CE->getDirectCallee();
+    if (!FD)
+      return "";
+    const ASTContext &Context = FD->getDeclContext()->getParentASTContext();
     // From
     // https://stackoverflow.com/questions/25075001/how-can-i-get-the-name-of-the-file-im-currently-visiting-with-clang
     // on how to get source file
     const SourceManager &SrcMgr = Context.getSourceManager();
     const FileEntry *Entry =
         SrcMgr.getFileEntryForID(SrcMgr.getFileID(CE->getExprLoc()));
+
+    if (!Entry)
+      return "";
     return Entry->getName().str();
   }
 
@@ -1557,6 +1580,9 @@ private:
     // on how to get source file
     const FileEntry *Entry =
         SM->getFileEntryForID(SM->getFileID(CE->getExprLoc()));
+
+    if (!Entry)
+      return "";
     return Entry->getName().str();
   }
 
@@ -1633,17 +1659,24 @@ int main(int argc, const char **argv) {
     SourcePaths.insert(getAbsolutePath(Path));
   }
 
-  if (HeaderCLI.empty()) {
-    llvm::errs() << "ERROR: Header file not specified with -header\n";
+  if (HeaderCLI.empty() && HeaderDirectoryCLI.empty()) {
+    llvm::errs()
+        << "ERROR: Header file and header directory both not specified\n";
     return 1;
   }
 
-  std::string HeaderAbsolutePath = getAbsolutePath(HeaderCLI.getValue());
+  std::string HeaderAbsolutePath =
+      HeaderCLI.empty() ? "" : getAbsolutePath(HeaderCLI.getValue());
+  std::string HeaderDirectoryAbsolutePath =
+      HeaderDirectoryCLI.empty()
+          ? ""
+          : getAbsolutePath(HeaderDirectoryCLI.getValue());
 
   RefactoringTool Tool(OptionsParser.getCompilations(),
                        OptionsParser.getSourcePathList());
 
-  YallaMatcher YM(SourcePaths, HeaderAbsolutePath, Tool.getReplacements());
+  YallaMatcher YM(SourcePaths, HeaderAbsolutePath, HeaderDirectoryAbsolutePath,
+                  Tool.getReplacements());
   MatchFinder Finder;
   Finder.addMatcher(ClassMatcher, &YM);
   Finder.addMatcher(ClassTemplateMatcher, &YM);
