@@ -11,7 +11,7 @@
 
 void WriteWrappersFile(
     const std::string &FileName, const std::vector<std::string> &FilesToInclude,
-    const std::unordered_map<std::string, WrapperInfo> &FunctionWrappers,
+    const std::unordered_set<std::string> &FunctionWrappers,
     const std::unordered_set<std::string> &ClassTemplateInstantiations,
     const std::unordered_set<std::string> &FunctionTemplateInstantiations) {
   std::ofstream WrappersFile(FileName);
@@ -20,8 +20,8 @@ void WriteWrappersFile(
   for (const std::string &IncludedFile : FilesToInclude)
     WrappersFile << "#include \"" << IncludedFile << "\"\n";
 
-  for (const auto &[WrapperName, WI] : FunctionWrappers)
-    WrappersFile << WI.WrapperDefinition << '\n';
+  for (const std::string &Definition : FunctionWrappers)
+    WrappersFile << Definition << '\n';
 
   for (const std::string &Instantiation : ClassTemplateInstantiations)
     WrappersFile << Instantiation;

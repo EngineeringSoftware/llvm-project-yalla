@@ -210,8 +210,8 @@ public:
   const std::unordered_map<std::string, FunctionInfo> &GetFunctions() const {
     return Functions;
   }
-  const std::unordered_map<std::string, WrapperInfo> &GetWrappers() const {
-    return FunctionWrappers;
+  const std::unordered_set<std::string> &GetWrapperDefinitions() const {
+    return WrapperFunctionDefinitions;
   }
   const std::unordered_set<std::string> &
   GetClassTemplateInstantiations() const {
@@ -238,6 +238,7 @@ private:
   const std::string YallaObject = "yalla_object";
   std::unordered_set<std::string> ClassTemplateInstantiations;
   std::unordered_set<std::string> FunctionTemplateInstantiations;
+  std::unordered_set<std::string> WrapperFunctionDefinitions;
 
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
     if (RD->isTemplated())
@@ -506,6 +507,8 @@ private:
         FullyScopedName, FullyScopedClassName, WrapperType,
         std::move(FunctionParameters), std::move(TemplateArguments));
 
+    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+
     FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
@@ -564,8 +567,24 @@ private:
     auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, ClassName, true,
                               ParametersThatCanBeRecordTypes);
-    std::string TemplateArguments =
-        GetTemplateTypenames(FTD, false, AddClassTemplateParams);
+
+    std::string TemplateArguments;
+    if (WrapperType == WrapperInfo::Constructor) {
+      const DeclContext *DC = FD->getDeclContext();
+
+      if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+        const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+
+        if (CTD) {
+          // The template arguments are going to be used to invoke the
+          // constructor, so we use the ClassTemplateDecl
+          TemplateArguments = GetTemplateTypenames(CTD, false);
+        }
+      }
+    } else {
+      TemplateArguments =
+          GetTemplateTypenames(FTD, false, AddClassTemplateParams);
+    }
 
     std::string WrapperFunctionSignature = TemplateTypenames + "\n" +
                                            WrapperReturnType + " " +
@@ -576,6 +595,8 @@ private:
         std::move(TemplateArguments));
 
     FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
         std::move(Parameters), std::move(WrapperFunctionDefinition),
@@ -1658,7 +1679,7 @@ int main(int argc, const char **argv) {
   auto ActionFactory = newFrontendActionFactory<IncludeFinderAction>();
   IncludeTool.run(ActionFactory.get());
 
-  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrappers(),
+  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrapperDefinitions(),
                     YM.GetClassTemplateInstantiations(),
                     YM.GetFunctionTemplateInstantiations());
 
