@@ -322,7 +322,8 @@ private:
     std::string FullyScopedName = "";
     while (!CurrentQT.isNull()) {
       T = CurrentQT.getTypePtr();
-      if (T->isBuiltinType() || T->isTemplateTypeParmType())
+      if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
+          T->isEnumeralType())
         return QT.getAsString();
 
       if (T->isRecordType()) {
