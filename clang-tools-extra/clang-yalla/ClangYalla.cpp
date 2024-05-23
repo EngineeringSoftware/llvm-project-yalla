@@ -79,6 +79,8 @@ DeclarationMatcher FunctionMatcher = anyOf(
 StatementMatcher FunctionCallMatcher =
     anyOf(callExpr().bind("FunctionCall"),
           cxxConstructExpr().bind("ConstructorCall"));
+StatementMatcher EnumConsantUsage =
+    declRefExpr(to(enumConstantDecl())).bind("EnumConstantUsage");
 
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
@@ -196,6 +198,16 @@ public:
       std::string FileName = GetContainingFile(CE);
       if (SourcePaths.find(FileName) != SourcePaths.end())
         AddConstructorUsage(CE);
+    }
+
+    if (const DeclRefExpr *DRE =
+            Result.Nodes.getNodeAs<clang::DeclRefExpr>("EnumConstantUsage")) {
+      if (const EnumConstantDecl *ECD =
+              dyn_cast<EnumConstantDecl>(DRE->getDecl())) {
+        std::string FileName = GetContainingFile(DRE);
+        if (SourcePaths.find(FileName) != SourcePaths.end())
+          AddEnumConstantUsage(DRE, ECD, FileName);
+      }
     }
   }
 
@@ -937,6 +949,7 @@ private:
     for (const EnumConstantDecl *ECD : ED->enumerators()) {
       EnumeratorValuePairs.emplace_back(ECD->getNameAsString(),
                                         llvm::toString(ECD->getInitVal(), 10));
+      AddEnumConstantWrapper(ED, ECD, FullyScopedName);
     }
 
     auto [EI, NewlyInserted] =
@@ -1608,6 +1621,60 @@ private:
     // } else if ()
   }
 
+  void AddEnumConstantWrapper(const EnumDecl *ED, const EnumConstantDecl *ECD,
+                              const std::string &FullyScopedName) {
+    std::string WrapperName =
+        "EnumWrapper_" + ED->getNameAsString() + "_" + ECD->getNameAsString();
+    std::string WrapperReturnType = FullyScopedName;
+
+    std::string EnumConstantScopedName =
+        FullyScopedName + "::" + ECD->getNameAsString();
+
+    std::string WrapperFunctionSignature =
+        FullyScopedName + " " + WrapperName + "()";
+    std::string WrapperDefinitionBody =
+        "return " + EnumConstantScopedName + ";";
+    std::string WrapperFunctionDefinition =
+        WrapperFunctionSignature + " {\n" + WrapperDefinitionBody + "}\n";
+
+    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+    std::vector<std::string> Parameters;
+
+    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    FunctionWrappers.try_emplace(
+        std::move(EnumConstantScopedName), std::move(WrapperName),
+        std::move(WrapperReturnType), "()",
+        std::move(WrapperFunctionDefinition), std::move(Parameters));
+  }
+
+  void AddEnumConstantUsage(const DeclRefExpr *DRE, const EnumConstantDecl *ECD,
+                            const std::string &FileName) {
+    const DeclContext *DC = ECD->getDeclContext();
+    if (!DC)
+      return;
+
+    const EnumDecl *ED = llvm::dyn_cast<EnumDecl>(DC);
+    auto [Scopes, FullyScopedName] = GetScopes(ED);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+    FullyScopedName += ED->getNameAsString();
+
+    FullyScopedName += "::" + ECD->getNameAsString();
+
+    auto WrapperIt = FunctionWrappers.find(FullyScopedName);
+    if (WrapperIt == FunctionWrappers.end())
+      llvm::report_fatal_error("Enum needs wrapper but none found");
+
+    std::string WrapperCall = WrapperIt->second.WrapperName + "()";
+    CharSourceRange Range =
+        CharSourceRange::getTokenRange(DRE->getSourceRange());
+
+    llvm::Error Err = Replace[FileName].add(Replacement(
+        ECD->getASTContext().getSourceManager(), Range, WrapperCall));
+    if (Err)
+      llvm::report_fatal_error(std::move(Err));
+  }
+
   std::string GetContainingFile(const Decl *D) const {
     const ASTContext &Context = D->getASTContext();
     // From
@@ -1637,6 +1704,10 @@ private:
     if (!Entry)
       return "";
     return Entry->getName().str();
+  }
+
+  std::string GetContainingFile(const DeclRefExpr *DRE) const {
+    return SM->getFilename(DRE->getBeginLoc()).str();
   }
 
   std::string GetContainingFile(const CXXConstructExpr *CE) const {
@@ -1749,6 +1820,7 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(ClassUsageMatcher, &YM);
   Finder.addMatcher(FunctionMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);
+  Finder.addMatcher(EnumConsantUsage, &YM);
 
   auto result = Tool.run(newFrontendActionFactory(&Finder).get());
 
