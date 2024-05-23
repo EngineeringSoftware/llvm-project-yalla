@@ -49,6 +49,8 @@ DeclarationMatcher ClassMatcher =
     recordDecl(unless(isImplicit())).bind("ClassDeclaration");
 DeclarationMatcher ClassTemplateMatcher =
     classTemplateDecl().bind("ClassTemplateDeclaration");
+DeclarationMatcher EnumMatcher =
+    enumDecl(unless(isImplicit())).bind("EnumDeclaration");
 DeclarationMatcher ClassUsageMatcher = anyOf(
     // fieldDecl(hasType(cxxRecordDecl(isClass()))).bind("Field"),
     // varDecl(hasType(cxxRecordDecl(isClass()))).bind("Variable")
@@ -113,6 +115,13 @@ public:
       std::string FileName = GetContainingFile(CTD);
       if (inSubstitutedHeader(FileName))
         AddClassInfo(CTD, FileName);
+    }
+
+    if (const EnumDecl *ED =
+            Result.Nodes.getNodeAs<clang::EnumDecl>("EnumDeclaration")) {
+      std::string FileName = GetContainingFile(ED);
+      if (inSubstitutedHeader(FileName))
+        AddEnumInfo(ED, FileName);
     }
 
     if (const CXXMethodDecl *MD =
@@ -217,6 +226,9 @@ public:
   const std::unordered_map<std::string, FunctionInfo> &GetFunctions() const {
     return Functions;
   }
+  const std::unordered_map<std::string, EnumInfo> &GetEnums() const {
+    return Enums;
+  }
   const std::unordered_set<std::string> &GetWrapperDefinitions() const {
     return WrapperFunctionDefinitions;
   }
@@ -233,6 +245,7 @@ private:
   std::unordered_map<std::string, ClassInfo> Classes;
   std::unordered_map<std::string, FunctionInfo> Functions;
   std::unordered_map<std::string, TemplatedFunctionInfo> TemplatedFunctions;
+  std::unordered_map<std::string, EnumInfo> Enums;
   const std::unordered_set<std::string> &SourcePaths;
   const std::string &HeaderPath;
   const std::string &HeaderDirectoryPath;
@@ -633,6 +646,22 @@ private:
     return ScopedDeclaration + "\n";
   }
 
+  std::string GetEnumDeclaration(const EnumDecl *ED, bool IsScoped,
+                                 std::string Size) const {
+    return std::string("enum ") + (IsScoped ? "class " : "") +
+           ED->getNameAsString() + " : " + Size + ";";
+  }
+
+  std::string
+  GenerateEnumForwardDeclaration(const EnumDecl *ED, bool IsScoped,
+                                 std::string Size,
+                                 const std::vector<TypeScope> &Scopes) const {
+    std::string Declaration = GetEnumDeclaration(ED, IsScoped, Size);
+    std::string ScopedDeclaration = SurroundWithScopes(Declaration, Scopes);
+
+    return ScopedDeclaration + "\n";
+  }
+
   // Returns the parameters as "(int a, double n, ...)" and the
   // argument names as ["a", "n", ...]
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
@@ -879,6 +908,42 @@ private:
                             std::move(Scopes), CTD->getTemplatedDecl(), Range);
     if (!NewlyInserted) {
       CI->second.HasDefinition |= HasDefinition;
+    }
+  }
+
+  void AddEnumInfo(const EnumDecl *ED, const std::string &FileName) {
+    std::string Name = ED->getNameAsString();
+    bool HasDefinition = ED->getDefinition() != nullptr;
+
+    auto [Scopes, FullyScopedName] = GetScopes(ED);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+    FullyScopedName += Name;
+
+    bool IsScoped = ED->isScoped() || ED->isScopedUsingClassTag();
+    std::string Size = GetParameterType(ED->getIntegerType());
+
+    if (Enums.find(FullyScopedName) == Enums.end()) {
+      std::string ForwardDeclaration =
+          GenerateEnumForwardDeclaration(ED, IsScoped, Size, Scopes);
+      ClassForwardDeclarations += ForwardDeclaration;
+      loc = ED->getASTContext().getSourceManager().getLocForStartOfFile(
+          ED->getASTContext().getSourceManager().getMainFileID());
+      MainFilename = FileName;
+      SM = &(ED->getASTContext().getSourceManager());
+    }
+
+    std::vector<std::pair<std::string, std::string>> EnumeratorValuePairs;
+    for (const EnumConstantDecl *ECD : ED->enumerators()) {
+      EnumeratorValuePairs.emplace_back(ECD->getNameAsString(),
+                                        llvm::toString(ECD->getInitVal(), 10));
+    }
+
+    auto [EI, NewlyInserted] =
+        Enums.try_emplace(FullyScopedName, Name, IsScoped, HasDefinition, Size,
+                          std::move(Scopes), std::move(EnumeratorValuePairs));
+    if (!NewlyInserted) {
+      EI->second.HasDefinition |= HasDefinition;
     }
   }
 
@@ -1680,6 +1745,7 @@ int main(int argc, const char **argv) {
   MatchFinder Finder;
   Finder.addMatcher(ClassMatcher, &YM);
   Finder.addMatcher(ClassTemplateMatcher, &YM);
+  Finder.addMatcher(EnumMatcher, &YM);
   Finder.addMatcher(ClassUsageMatcher, &YM);
   Finder.addMatcher(FunctionMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);

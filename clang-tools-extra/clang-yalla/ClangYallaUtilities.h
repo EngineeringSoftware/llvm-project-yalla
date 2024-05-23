@@ -125,4 +125,21 @@ struct WrapperInfo {
         WrapperParameterTypes(std::move(WrapperParameterTypes)) {}
 };
 
+struct EnumInfo {
+  std::string Name;
+  bool IsScoped;
+  bool HasDefinition;
+  std::string Size;
+  std::vector<TypeScope> Scopes;
+  std::vector<std::pair<std::string, std::string>> EnumeratorValuePairs;
+
+  EnumInfo(
+      std::string Name, bool isScoped, bool HasDefinition, std::string Size,
+      std::vector<TypeScope> &&Scopes,
+      std::vector<std::pair<std::string, std::string>> &&EnumeratorValuePairs)
+      : Name(std::move(Name)), IsScoped(IsScoped), HasDefinition(HasDefinition),
+        Size(std::move(Size)), Scopes(std::move(Scopes)),
+        EnumeratorValuePairs(std::move(EnumeratorValuePairs)) {}
+};
+
 #endif
