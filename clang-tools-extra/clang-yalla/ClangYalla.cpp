@@ -410,14 +410,19 @@ private:
         if (const clang::TemplateSpecializationType *TST =
                 dyn_cast<clang::TemplateSpecializationType>(T)) {
           clang::TemplateName TN = TST->getTemplateName();
+
           if (clang::TemplateDecl *TD = TN.getAsTemplateDecl())
             RD = dyn_cast<clang::CXXRecordDecl>(TD->getTemplatedDecl());
         } else if (const clang::PackExpansionType *PET =
                        dyn_cast<clang::PackExpansionType>(T)) {
           return CurrentQT.getAsString();
+        } else if (const DependentNameType *DNT =
+                       dyn_cast<clang::DependentNameType>(T)) {
+          return CurrentQT.getAsString();
         } else {
           const InjectedClassNameType *InjectedType =
-              static_cast<const clang::InjectedClassNameType *>(T);
+              dyn_cast<clang::InjectedClassNameType>(T);
+
           RD = InjectedType->getDecl();
         }
 
@@ -1257,6 +1262,8 @@ private:
     if (!(DD->getType()->isReferenceType() || DD->getType()->isPointerType())) {
       llvm::Error Err = Replace[FileName].add(Replacement(
           DD->getASTContext().getSourceManager(), Range, NewDeclaration));
+      if (Err)
+        llvm::report_fatal_error(std::move(Err));
     }
 
     ClassInfo &CI = it->second;
@@ -1327,11 +1334,14 @@ private:
         }
 
         std::string InstantiationReturnType = it->second.WrapperReturnType;
-        size_t ReplaceStart = InstantiationReturnType.find('<');
-        size_t ReplaceEnd = InstantiationReturnType.rfind('>');
+        if (ClassTemplateArgs != "") {
+          size_t ReplaceStart = InstantiationReturnType.find('<');
+          size_t ReplaceEnd = InstantiationReturnType.rfind('>');
 
-        InstantiationReturnType.replace(ReplaceStart, ReplaceEnd,
-                                        ClassTemplateArgs);
+          InstantiationReturnType.replace(ReplaceStart, ReplaceEnd,
+                                          ClassTemplateArgs);
+        }
+
         if (!(*InstantiationReturnType.end() == '*'))
           InstantiationReturnType += "*";
 
@@ -1348,6 +1358,8 @@ private:
         llvm::Error Err = Replace[FileName].add(Replacement(
             DD->getASTContext().getSourceManager(),
             CharSourceRange::getTokenRange(CE->getSourceRange()), ReplaceWith));
+        if (Err)
+          llvm::report_fatal_error(std::move(Err));
       }
     }
 
@@ -1590,10 +1602,10 @@ private:
 
     if (isTemplateInstantiation(FD)) {
       if (TemplatedFunctions.find(FullyScopedName) == TemplatedFunctions.end())
-        llvm::report_fatal_error("Found function usage before definition");
+        return;
     } else {
       if (Functions.find(FullyScopedName) == Functions.end())
-        llvm::report_fatal_error("Found function usage before definition");
+        return;
     }
 
     if (FunctionNeedsWrapper(FD)) {
@@ -1848,6 +1860,8 @@ private:
         Scopes.emplace(Scopes.begin(), RD->getNameAsString(),
                        TypeScope::ScopeType::ClassScope);
       } else if (DC->getDeclKind() == Decl::Kind::UnresolvedUsingValue) {
+        break;
+      } else if (DC->getDeclKind() == Decl::Kind::LinkageSpec) {
         break;
       } else {
         llvm::report_fatal_error("Scope can only be namespace or class");
