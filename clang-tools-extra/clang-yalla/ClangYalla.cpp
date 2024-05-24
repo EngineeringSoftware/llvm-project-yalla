@@ -103,7 +103,13 @@ public:
 
     if (const RecordDecl *RD =
             Result.Nodes.getNodeAs<clang::RecordDecl>("ClassDeclaration")) {
+      if (RD->getNameAsString() == "")
+        return;
+
       if (isTemplatedDeclaration(RD))
+        return;
+
+      if (isNestedClass(RD))
         return;
 
       std::string FileName = GetContainingFile(RD);
@@ -131,13 +137,20 @@ public:
       if (isTemplateInstantiation(MD))
         return;
 
+      if (MD->getParent()->isUnion())
+        return;
+
       if (isTemplateInstantiation(MD->getParent()))
+        return;
+
+      if (isNestedClass(MD->getParent()))
         return;
 
       std::string FileName = GetContainingFile(MD);
       if (inSubstitutedHeader(FileName)) {
         std::string ClassName = MD->getParent()->getNameAsString();
         auto [Scopes, FullyScopedClassName] = GetScopes(MD->getParent());
+
         if (!FullyScopedClassName.empty())
           FullyScopedClassName += "::";
         FullyScopedClassName += ClassName;
@@ -314,16 +327,23 @@ private:
                TSK_ExplicitInstantiationDefinition;
   }
 
-  std::string GetParameterType(const QualType &QT) const {
+  std::string GetParameterType(const QualType &QT,
+                               const ASTContext &Context) const {
     QualType CurrentQT = QT;
+
+    std::string CurrentTypename = QT.getAsString();
+    if (CurrentTypename.rfind("std::", 0) ==
+        0) // pos=0 limits the search to the prefix)
+      return CurrentTypename;
 
     const clang::Type *T;
     std::string OriginalTypeName = "";
     std::string FullyScopedName = "";
     while (!CurrentQT.isNull()) {
-      T = CurrentQT.getTypePtr();
+      T = CurrentQT.getDesugaredType(Context).getTypePtr();
+
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
-          T->isEnumeralType())
+          T->isEnumeralType() || T->isConstantArrayType())
         return QT.getAsString();
 
       if (T->isRecordType()) {
@@ -336,21 +356,89 @@ private:
         break;
       }
 
-      if (T->isPointerType() || T->isReferenceType()) {
+      if (T->isPointerType() || T->isReferenceType() ||
+          T->isMemberPointerType()) {
         CurrentQT = T->getPointeeType();
         continue;
       }
 
+      if (T->isFunctionProtoType()) {
+        // This is meant for the following code:
+        // In rapidjson/error.h, we have:
+        // ```
+        // struct ParseResult {
+        //     //!! Unspecified boolean type
+        //     typedef bool (ParseResult::*BooleanType)() const;
+        // public:
+        //     operator BooleanType() const { return !IsError() ?
+        //     &ParseResult::IsError : NULL; }
+        // ```
+        // This is needed for the return type of BooleanType()
+
+        const FunctionProtoType *FPT =
+            static_cast<const clang::FunctionProtoType *>(T);
+        CurrentQT = FPT->getReturnType();
+        continue;
+      }
+
       if (T->isDependentType()) {
-        const InjectedClassNameType *InjectedType =
-            static_cast<const clang::InjectedClassNameType *>(T);
-        const CXXRecordDecl *RD = InjectedType->getDecl();
+        if (const TypedefType *TT = CurrentQT->getAs<TypedefType>()) {
+          // This is to handle the return type of Peek() in the following case
+          // ```
+          // template <typename InputStream, typename Encoding = UTF8<> >
+          // class GenericStreamWrapper {
+          // public:
+          //     typedef typename Encoding::Ch Ch;
+          //     Ch Peek() const { return is_.Peek(); }
+          // ```
+          // It returns "typename Encoding::Ch"
+          const TypedefNameDecl *TND = TT->getDecl();
+          QualType UnderlyingType = TND->getUnderlyingType();
+          return UnderlyingType.getAsString();
+        }
+
+        const CXXRecordDecl *RD = nullptr;
+
+        // This handles the following case
+        // ```
+        // template <typename T>
+        // class TemplatedClass {
+        //    template <typename U>
+        //    TemplatedClass(const TemplatedClass<U>& rhs) : x(rhs.x) {}
+        // ```
+        // This gets us "const TemplatedClass<U>& rhs"
+        if (const clang::TemplateSpecializationType *TST =
+                dyn_cast<clang::TemplateSpecializationType>(T)) {
+          clang::TemplateName TN = TST->getTemplateName();
+          if (clang::TemplateDecl *TD = TN.getAsTemplateDecl())
+            RD = dyn_cast<clang::CXXRecordDecl>(TD->getTemplatedDecl());
+        } else if (const clang::PackExpansionType *PET =
+                       dyn_cast<clang::PackExpansionType>(T)) {
+          return CurrentQT.getAsString();
+        } else {
+          const InjectedClassNameType *InjectedType =
+              static_cast<const clang::InjectedClassNameType *>(T);
+          RD = InjectedType->getDecl();
+        }
+
+        // Check if it starts with "typename " and return it directly
+        // if so. This is for the case of
+        // ```
+        // template<typename Stream>
+        // inline void PutUnsafe(Stream& stream, typename Stream::Ch c);
+        // ```
+        // to get "typename Stream::Ch". Without this, we get a segfault
+        std::string TypenameString = CurrentQT.getAsString();
+        if ((TypenameString.rfind("typename ", 0) == 0) ||
+            (TypenameString.rfind("const typename ", 0) ==
+             0)) // pos=0 limits the search to the prefix)
+          return TypenameString;
 
         if (!RD)
           llvm::report_fatal_error("RD cannot be null here\n");
 
         auto [Scopes, ScopesOnly] = GetScopes(RD);
-        OriginalTypeName = T->getAsRecordDecl()->getNameAsString();
+        OriginalTypeName = RD->getNameAsString();
         if (!ScopesOnly.empty())
           ScopesOnly += "::";
         FullyScopedName = ScopesOnly + OriginalTypeName;
@@ -499,7 +587,8 @@ private:
           dyn_cast<CXXMethodDecl>(FD)->getParent()->getTypeForDecl();
 
       QualType ClassType = T->getCanonicalTypeInternal();
-      WrapperReturnType = GetParameterType(ClassType) + "*";
+      WrapperReturnType =
+          GetParameterType(ClassType, FD->getASTContext()) + "*";
     } else {
       if (FD->isCXXClassMember())
         WrapperType = WrapperInfo::Method;
@@ -509,7 +598,7 @@ private:
       WrapperName = "Wrapper_" + FD->getNameAsString();
       QualType ReturnType = FD->getReturnType();
 
-      WrapperReturnType = GetParameterType(ReturnType);
+      WrapperReturnType = GetParameterType(ReturnType, FD->getASTContext());
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
           WrapperReturnType += "*";
@@ -576,7 +665,8 @@ private:
           dyn_cast<CXXMethodDecl>(FD)->getParent()->getTypeForDecl();
 
       QualType ClassType = T->getCanonicalTypeInternal();
-      WrapperReturnType = GetParameterType(ClassType) + "*";
+      WrapperReturnType =
+          GetParameterType(ClassType, FTD->getASTContext()) + "*";
       AddClassTemplateParams = true;
     } else {
       if (FD->isCXXClassMember())
@@ -585,7 +675,7 @@ private:
         WrapperType = WrapperInfo::Function;
 
       WrapperName = "Wrapper_" + FD->getNameAsString();
-      WrapperReturnType = GetParameterType(ReturnType);
+      WrapperReturnType = GetParameterType(ReturnType, FTD->getASTContext());
 
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
@@ -716,7 +806,8 @@ private:
 
     int current = 0;
     for (const auto &Param : FD->parameters()) {
-      std::string ParamType = GetParameterType(Param->getType());
+      std::string ParamType =
+          GetParameterType(Param->getType(), FD->getASTContext());
       if ((ForWrapper && Param->getType()->isRecordType()) ||
           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
                              ParametersThatCanBeRecordTypes.end()))
@@ -745,7 +836,8 @@ private:
 
   std::string GetFunctionSignature(const FunctionDecl *FD,
                                    const std::string &ClassName) const {
-    std::string ReturnType = GetParameterType(FD->getReturnType());
+    std::string ReturnType =
+        GetParameterType(FD->getReturnType(), FD->getASTContext());
     std::string Name = FD->getNameAsString();
     auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, ClassName, false);
@@ -834,9 +926,9 @@ private:
           dyn_cast<CXXMethodDecl>(FD)->getParent()->getTypeForDecl();
 
       QualType ClassType = T->getCanonicalTypeInternal();
-      ReturnType = GetParameterType(ClassType) + "*";
+      ReturnType = GetParameterType(ClassType, FTD->getASTContext()) + "*";
     } else {
-      ReturnType = GetParameterType(FD->getReturnType());
+      ReturnType = GetParameterType(FD->getReturnType(), FTD->getASTContext());
     }
 
     std::string Name = FD->getNameAsString();
@@ -934,7 +1026,8 @@ private:
     FullyScopedName += Name;
 
     bool IsScoped = ED->isScoped() || ED->isScopedUsingClassTag();
-    std::string Size = GetParameterType(ED->getIntegerType());
+    std::string Size =
+        GetParameterType(ED->getIntegerType(), ED->getASTContext());
 
     if (Enums.find(FullyScopedName) == Enums.end()) {
       std::string ForwardDeclaration =
@@ -1754,6 +1847,8 @@ private:
       } else if (const RecordDecl *RD = dyn_cast<RecordDecl>(DC)) {
         Scopes.emplace(Scopes.begin(), RD->getNameAsString(),
                        TypeScope::ScopeType::ClassScope);
+      } else if (DC->getDeclKind() == Decl::Kind::UnresolvedUsingValue) {
+        break;
       } else {
         llvm::report_fatal_error("Scope can only be namespace or class");
       }
@@ -1778,6 +1873,17 @@ private:
       llvm::report_fatal_error("RecordType cannot be nullptr");
 
     return RT->getDecl()->getNameAsString();
+  }
+
+  bool isNestedClass(const RecordDecl *RD) const {
+    const DeclContext *DC = RD->getDeclContext();
+    if (!DC)
+      return false;
+
+    if (const RecordDecl *ParentClass = dyn_cast<RecordDecl>(DC))
+      return true;
+
+    return false;
   }
 };
 
