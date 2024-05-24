@@ -286,6 +286,9 @@ private:
   std::unordered_set<std::string> FunctionTemplateInstantiations;
   std::unordered_set<std::string> WrapperFunctionDefinitions;
 
+  using NodeID = int64_t;
+  std::unordered_set<NodeID> DeclarationsUsed;
+
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
       return Filename == HeaderPath;
@@ -518,11 +521,12 @@ private:
 
   std::string GenerateWrapperDefinition(
       const std::string &Signature, const std::string &ReturnType,
-      const std::string &FunctionName, const std::string &FullyScopedName,
+      bool ReturnsClassByValue, const std::string &FunctionName,
+      const std::string &FullyScopedName,
       const std::string &FullyScopedClassName,
       WrapperInfo::WrapperType WrapperType,
       std::vector<std::string> &&WrapperArguments,
-      std::string &&TemplateArguments = "") const {
+      std::string &&TemplateArguments) const {
     std::string WrapperBody;
     std::string JoinedArguments = "";
 
@@ -543,6 +547,20 @@ private:
 
     JoinedArguments = "(" + JoinedArguments + ")";
 
+    std::string DynamicallyAllocatedConstructorStart = "";
+    std::string DynamicallyAllocatedConstructorEnd = "";
+    if (ReturnsClassByValue) {
+      std::string ConstructorCall = ReturnType;
+
+      if (ConstructorCall.back() != '*')
+        llvm::report_fatal_error("Attempting to return class by pointer when "
+                                 "the return type is not a pointer");
+
+      ConstructorCall.pop_back();
+      DynamicallyAllocatedConstructorStart = "new " + ConstructorCall + "(";
+      DynamicallyAllocatedConstructorEnd = ")";
+    }
+
     switch (WrapperType) {
     case WrapperInfo::Destructor:
       WrapperBody = "delete " + WrapperArguments[0] + ";\n";
@@ -560,13 +578,16 @@ private:
       else
         TemplateKeyword = "template ";
 
-      WrapperBody = "return " + YallaObject + "->" + TemplateKeyword +
-                    FunctionName + TemplateArguments + JoinedArguments + ";\n";
+      WrapperBody = "return " + DynamicallyAllocatedConstructorStart +
+                    YallaObject + "->" + TemplateKeyword + FunctionName +
+                    TemplateArguments + JoinedArguments +
+                    DynamicallyAllocatedConstructorEnd + ";\n";
       break;
     }
     case WrapperInfo::Function:
-      WrapperBody = "return " + FullyScopedName + TemplateArguments +
-                    JoinedArguments + ";\n";
+      WrapperBody = "return " + DynamicallyAllocatedConstructorStart +
+                    FullyScopedName + TemplateArguments + JoinedArguments +
+                    DynamicallyAllocatedConstructorEnd + ";\n";
       break;
     }
 
@@ -579,6 +600,7 @@ private:
                           const std::string &FullyScopedClassName) {
     std::string WrapperName;
     std::string WrapperReturnType;
+    bool ReturnsClassByValue = false;
     WrapperInfo::WrapperType WrapperType;
 
     if (clang::isa<CXXDestructorDecl>(FD)) {
@@ -605,8 +627,10 @@ private:
 
       WrapperReturnType = GetParameterType(ReturnType, FD->getASTContext());
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
-        if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
+        if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
           WrapperReturnType += "*";
+          ReturnsClassByValue = true;
+        }
       }
     }
 
@@ -638,9 +662,10 @@ private:
     std::string WrapperFunctionSignature =
         TemplateTypenames + WrapperReturnType + " " + WrapperName + Parameters;
     std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
-        WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
-        FullyScopedName, FullyScopedClassName, WrapperType,
-        std::move(FunctionParameters), std::move(TemplateArguments));
+        WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
+        FD->getNameAsString(), FullyScopedName, FullyScopedClassName,
+        WrapperType, std::move(FunctionParameters),
+        std::move(TemplateArguments));
 
     WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
 
@@ -656,6 +681,7 @@ private:
                           const std::string &ClassName) {
     const FunctionDecl *FD = FTD->getTemplatedDecl();
     QualType ReturnType = FD->getReturnType();
+    bool ReturnsClassByValue = false;
     WrapperInfo::WrapperType WrapperType;
 
     std::string TemplateTypenames = GetTemplateTypenames(FTD);
@@ -683,8 +709,10 @@ private:
       WrapperReturnType = GetParameterType(ReturnType, FTD->getASTContext());
 
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
-        if (!(ReturnType->isPointerType() || ReturnType->isReferenceType()))
+        if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
           WrapperReturnType += "*";
+          ReturnsClassByValue = true;
+        }
       }
       AddClassTemplateParams = false;
     }
@@ -726,9 +754,9 @@ private:
                                            WrapperReturnType + " " +
                                            WrapperName + Parameters;
     std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
-        WrapperFunctionSignature, WrapperReturnType, FD->getNameAsString(),
-        FullyScopedName, ClassName, WrapperType, std::move(FunctionParameters),
-        std::move(TemplateArguments));
+        WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
+        FD->getNameAsString(), FullyScopedName, ClassName, WrapperType,
+        std::move(FunctionParameters), std::move(TemplateArguments));
 
     FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
@@ -813,21 +841,31 @@ private:
     for (const auto &Param : FD->parameters()) {
       std::string ParamType =
           GetParameterType(Param->getType(), FD->getASTContext());
+      std::string ArgumentDereference = "";
       if ((ForWrapper && Param->getType()->isRecordType()) ||
           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
-                             ParametersThatCanBeRecordTypes.end()))
+                             ParametersThatCanBeRecordTypes.end())) {
         ParamType += "*";
+        ArgumentDereference = "*"; // Need to dereference the parameter that we
+                                   // are making into a pointer
+      }
 
       Parameters += ParamType;
 
+      std::string ArgumentName = Param->getNameAsString();
+      // Handle arguments with no name
+      if (ArgumentName == "")
+        ArgumentName =
+            std::string("yalla_placeholder_arg_") + std::to_string(current);
+
       Parameters += " ";
-      Parameters += Param->getNameAsString();
+      Parameters += ArgumentName;
       Parameters += ", ";
 
-      current++;
-
-      FunctionArguments.push_back(Param->getNameAsString());
+      FunctionArguments.push_back(ArgumentDereference + ArgumentName);
       FunctionArgumentTypes.emplace_back(ParamType);
+
+      current++;
     }
 
     // Remove the ', '
@@ -1345,9 +1383,11 @@ private:
         if (!(*InstantiationReturnType.end() == '*'))
           InstantiationReturnType += "*";
 
-        FunctionTemplateInstantiations.insert(
-            "template " + InstantiationReturnType + " " + WrapperName +
-            TemplateArgs + "(" + WrapperArgumentTypes + ");\n");
+        if (TemplateArgs != "") {
+          FunctionTemplateInstantiations.insert(
+              "template " + InstantiationReturnType + " " + WrapperName +
+              TemplateArgs + "(" + WrapperArgumentTypes + ");\n");
+        }
 
         // This condition is false if the constructor does not look
         // like "ClassWithMethod c6 = ClassWithMethod(4);". I'm not
@@ -1498,6 +1538,8 @@ private:
       }
       Arg->printPretty(CallOS, nullptr, Policy, 0);
       TypesOS << Arg->getType().getAsString();
+      if (Arg->getType()->isRecordType())
+        TypesOS << "*";
     }
 
     CallOS.flush();
@@ -1536,27 +1578,6 @@ private:
     std::string WrapperCall = WrapperName + TemplateArgs + "(" + ArgsStr + ")";
 
     return {WrapperCall, ArgTypesStr};
-  }
-
-  std::string InstantiateTemplateParameter(
-      const std::string &ParamType,
-      const std::unordered_map<std::string, std::string>
-          &TemplateParameterToArgument) const {
-    auto It = TemplateParameterToArgument.find(ParamType);
-    std::string Instantiation;
-
-    if (It != TemplateParameterToArgument.end()) {
-      // Exact match to template parameter
-      Instantiation = It->second;
-    } else if (ParamType.find("<") != std::string::npos) {
-      // Something similar to TemplatedClass<T>
-
-    } else {
-      // Not templated
-      Instantiation = ParamType;
-    }
-
-    return Instantiation;
   }
 
   std::string GetTemplatedWrapperInstantiation(
@@ -1649,22 +1670,35 @@ private:
             : Functions.find(FullyScopedName)->second.Usages;
     Usages.emplace_back(FD->getNameAsString());
 
-    if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+    // if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+    // No point in instantiating methods
+    if (isTemplateInstantiation(FD) && !FD->isCXXClassMember()) {
       const FunctionTemplateSpecializationInfo *FTSI =
           FD->getTemplateSpecializationInfo();
-      const FunctionTemplateDecl *FTD = FD->getDescribedFunctionTemplate();
 
       if (!FTSI)
         llvm::report_fatal_error("Could not get function specialization info "
                                  "for explicit instantiation");
 
+      const FunctionTemplateDecl *FTD = FTSI->getTemplate();
       if (!FTD)
         llvm::report_fatal_error(
             "Could not get function template decl for explicit instantiation");
 
+      QualType ReturnType = FD->getReturnType();
+      const FunctionProtoType *FPT = ReturnType->getAs<FunctionProtoType>();
+      if (FPT) {
+        QualType ReturnType = FD->getASTContext().getFunctionType(
+            FPT->getReturnType(), FPT->getParamTypes(), FPT->getExtProtoInfo());
+      }
+
       auto [FunctionTemplateArgs, TemplateParameterMap] = GetTemplateArgs(FTSI);
-      FunctionTemplateInstantiations.insert(GenerateFunctionForwardDeclaration(
-          FTD, Scopes, FunctionTemplateArgs));
+      auto [Parameters, FunctionParameters, FunctionParameterTypes] =
+          GetFunctionParameters(FD, "", false);
+
+      FunctionTemplateInstantiations.insert(
+          "template " + ReturnType.getAsString() + " " + FullyScopedName +
+          FunctionTemplateArgs + Parameters + ";\n");
     }
   }
 
