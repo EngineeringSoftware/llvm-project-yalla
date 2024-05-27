@@ -92,9 +92,25 @@ public:
         HeaderDirectoryPath(HeaderDirectoryPath), Replace(Replace) {}
 
   virtual void onEndOfTranslationUnit() override {
-    if (ClassForwardDeclarations != "" || FunctionForwardDeclarations != "") {
-      Replace[MainFilename].add(Replacement(
-          *SM, loc, 0, ClassForwardDeclarations + FunctionForwardDeclarations));
+    std::string AllForwardDeclarations = "";
+    for (const auto &[NodeID, ForwardDeclarations] : ClassForwardDeclarations) {
+      if (DeclarationsUsed.count(NodeID) > 0) {
+        for (const std::string &ForwardDeclaration : ForwardDeclarations)
+          AllForwardDeclarations += ForwardDeclaration;
+      }
+    }
+
+    for (const auto &[NodeID, ForwardDeclarations] :
+         FunctionForwardDeclarations) {
+      if (DeclarationsUsed.count(NodeID) > 0) {
+        for (const std::string &ForwardDeclaration : ForwardDeclarations)
+          AllForwardDeclarations += ForwardDeclaration;
+      }
+    }
+
+    if (AllForwardDeclarations != "") {
+      Replace[MainFilename].add(
+          Replacement(*SM, loc, 0, AllForwardDeclarations));
     }
   }
 
@@ -301,8 +317,14 @@ public:
   const std::unordered_map<std::string, EnumInfo> &GetEnums() const {
     return Enums;
   }
-  const std::unordered_set<std::string> &GetWrapperDefinitions() const {
-    return WrapperFunctionDefinitions;
+  std::unordered_set<std::string> GetWrapperDefinitions() {
+    std::unordered_set<std::string> AllDefinitions;
+    for (auto &[NodeID, WrapperDefinitions] : WrapperFunctionDefinitions) {
+      if (DeclarationsUsed.count(NodeID) > 0)
+        AllDefinitions.merge(WrapperDefinitions);
+    }
+
+    return AllDefinitions;
   }
   const std::unordered_set<std::string> &
   GetClassTemplateInstantiations() const {
@@ -322,8 +344,6 @@ private:
   const std::string &HeaderPath;
   const std::string &HeaderDirectoryPath;
   std::map<std::string, Replacements> &Replace;
-  std::string ClassForwardDeclarations = "";
-  std::string FunctionForwardDeclarations = "";
   SourceLocation loc;
   std::string MainFilename;
   SourceManager *SM;
@@ -331,10 +351,15 @@ private:
   const std::string YallaObject = "yalla_object";
   std::unordered_set<std::string> ClassTemplateInstantiations;
   std::unordered_set<std::string> FunctionTemplateInstantiations;
-  std::unordered_set<std::string> WrapperFunctionDefinitions;
 
-  using NodeID = int64_t;
-  std::unordered_set<NodeID> DeclarationsUsed;
+  std::unordered_set<int64_t> DeclarationsUsed;
+  std::unordered_set<int64_t> DeclarationsSeen;
+  std::unordered_map<int64_t, std::vector<std::string>>
+      ClassForwardDeclarations;
+  std::unordered_map<int64_t, std::vector<std::string>>
+      FunctionForwardDeclarations;
+  std::unordered_map<int64_t, std::unordered_set<std::string>>
+      WrapperFunctionDefinitions;
 
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
@@ -800,13 +825,17 @@ private:
         WrapperInfo::Constructor, std::move(FunctionParameters),
         std::move(TemplateArguments));
 
-    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+    WrapperFunctionDefinitions[RD->getID()].insert(WrapperFunctionDefinition);
 
-    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
         std::move(Parameters), std::move(WrapperFunctionDefinition),
         std::move(FunctionParameterTypes));
+
+    // We are adding the RD ID instead of a function ID because the function
+    // does not exist
+    FunctionForwardDeclarations[RD->getID()].push_back(
+        WrapperFunctionSignature + ";\n");
 
     auto [FI, NewlyInserted] = Functions.try_emplace(
         FullyScopedName, RD->getNameAsString(), GetContainingFile(RD),
@@ -887,9 +916,10 @@ private:
         WrapperType, std::move(FunctionParameters),
         std::move(TemplateArguments));
 
-    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+    WrapperFunctionDefinitions[FD->getID()].insert(WrapperFunctionDefinition);
+    FunctionForwardDeclarations[FD->getID()].push_back(
+        WrapperFunctionSignature + ";\n");
 
-    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
         std::move(Parameters), std::move(WrapperFunctionDefinition),
@@ -978,8 +1008,11 @@ private:
         FD->getNameAsString(), FullyScopedName, ClassName, WrapperType,
         std::move(FunctionParameters), std::move(TemplateArguments));
 
-    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
-    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+    WrapperFunctionDefinitions[FTD->getTemplatedDecl()->getID()].insert(
+        WrapperFunctionDefinition);
+
+    FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].push_back(
+        WrapperFunctionSignature + ";\n");
 
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
@@ -1235,10 +1268,14 @@ private:
           GenerateClassForwardDeclaration(RD, Scopes);
       loc = RD->getASTContext().getSourceManager().getLocForStartOfFile(
           RD->getASTContext().getSourceManager().getMainFileID());
-      ClassForwardDeclarations += ForwardDeclaration;
       MainFilename = FileName;
       SM = &(RD->getASTContext().getSourceManager());
+
+      ClassForwardDeclarations[RD->getID()].push_back(
+          std::move(ForwardDeclaration));
     }
+
+    DeclarationsSeen.insert(RD->getID());
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(RD->getBeginLoc(), RD->getEndLoc());
@@ -1264,10 +1301,14 @@ private:
           CTD->getTemplatedDecl(), Scopes, GetTemplateTypenames(CTD) + "\n");
       loc = CTD->getASTContext().getSourceManager().getLocForStartOfFile(
           CTD->getASTContext().getSourceManager().getMainFileID());
-      ClassForwardDeclarations += ForwardDeclaration;
       MainFilename = FileName;
       SM = &(CTD->getASTContext().getSourceManager());
+
+      ClassForwardDeclarations[CTD->getTemplatedDecl()->getID()].push_back(
+          std::move(ForwardDeclaration));
     }
+
+    DeclarationsSeen.insert(CTD->getTemplatedDecl()->getID());
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(CTD->getBeginLoc(), CTD->getEndLoc());
@@ -1315,12 +1356,16 @@ private:
     if (Enums.find(FullyScopedName) == Enums.end()) {
       std::string ForwardDeclaration =
           GenerateEnumForwardDeclaration(ED, IsScoped, Size, Scopes);
-      ClassForwardDeclarations += ForwardDeclaration;
       loc = ED->getASTContext().getSourceManager().getLocForStartOfFile(
           ED->getASTContext().getSourceManager().getMainFileID());
       MainFilename = FileName;
       SM = &(ED->getASTContext().getSourceManager());
+
+      ClassForwardDeclarations[ED->getID()].push_back(
+          std::move(ForwardDeclaration));
     }
+
+    DeclarationsSeen.insert(ED->getID());
 
     std::vector<std::pair<std::string, std::string>> EnumeratorValuePairs;
     for (const EnumConstantDecl *ECD : ED->enumerators()) {
@@ -1552,6 +1597,11 @@ private:
                            Type->isReferenceType() || Type->isPointerType(), DD,
                            Range);
 
+    if (DeclarationsSeen.count(CI.RD->getID()) == 0)
+      llvm::report_fatal_error("Class usage appears before definition");
+
+    DeclarationsUsed.insert(CI.RD->getID());
+
     if (const VarDecl *VD = clang::dyn_cast<clang::VarDecl>(DD)) {
       if (!VD->hasInit())
         return;
@@ -1579,6 +1629,16 @@ private:
         // IgnoreUnlessSpelledInSource() is needed for
         // "ClassWithMethod c6 = ClassWithMethod(4);"
         const FunctionDecl *FD = CE->getConstructor();
+
+        const FunctionDecl *SeenDecl =
+            GetOriginalFunctionDeclFromInstantiation(FD);
+        if (DeclarationsSeen.count(SeenDecl->getID()) > 0)
+          DeclarationsUsed.insert(SeenDecl->getID());
+        else if (DeclarationsSeen.count(CI.RD->getID()) > 0)
+          DeclarationsUsed.insert(SeenDecl->getID());
+        else
+          llvm::report_fatal_error(
+              "Constructor usage appears before definition");
 
         if (isTemplateInstantiation(FD)) {
           if (const FunctionTemplateDecl *FTD =
@@ -1699,11 +1759,14 @@ private:
       // If it needs a wrapper, AddFunctionWrapper will add it to the
       // forward declarations
       if (!NeedsWrapper)
-        FunctionForwardDeclarations += ForwardDeclaration;
+        FunctionForwardDeclarations[FD->getID()].push_back(
+            std::move(ForwardDeclaration));
 
       MainFilename = FileName;
       SM = &(FD->getASTContext().getSourceManager());
     }
+
+    DeclarationsSeen.insert(FD->getID());
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(FD->getBeginLoc(), FD->getEndLoc());
@@ -1757,11 +1820,14 @@ private:
       // function even if it needs a wrapper. Methods cannot be
       // forward declared so we do not forward declare them.
       if (!FTD->getTemplatedDecl()->isCXXClassMember())
-        FunctionForwardDeclarations += ForwardDeclaration;
+        FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].push_back(
+            std::move(ForwardDeclaration));
 
       MainFilename = FileName;
       SM = &(FTD->getASTContext().getSourceManager());
     }
+
+    DeclarationsSeen.insert(FTD->getTemplatedDecl()->getID());
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(FTD->getBeginLoc(), FTD->getEndLoc());
@@ -1906,6 +1972,13 @@ private:
       if (Functions.find(FullyScopedName) == Functions.end())
         return;
     }
+
+    const FunctionDecl *SeenDecl = GetOriginalFunctionDeclFromInstantiation(FD);
+
+    if (DeclarationsSeen.count(SeenDecl->getID()) == 0)
+      llvm::report_fatal_error("Function usage appears before definition");
+
+    DeclarationsUsed.insert(SeenDecl->getID());
 
     if (FunctionNeedsWrapper(FD)) {
       auto WrapperIt = FunctionWrappers.find(FullyScopedName);
@@ -2059,10 +2132,12 @@ private:
     std::string WrapperFunctionDefinition =
         WrapperFunctionSignature + " {\n" + WrapperDefinitionBody + "}\n";
 
-    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+    WrapperFunctionDefinitions[ED->getID()].insert(WrapperFunctionDefinition);
     std::vector<std::string> Parameters;
 
-    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    FunctionForwardDeclarations[ED->getID()].push_back(
+        WrapperFunctionSignature + ";\n");
+
     FunctionWrappers.try_emplace(
         std::move(EnumConstantScopedName), std::move(WrapperName),
         std::move(WrapperReturnType), "()",
@@ -2079,6 +2154,11 @@ private:
 
     if (isDefinedInMainSourceFile(ED))
       return;
+
+    if (DeclarationsSeen.count(ED->getID()) == 0)
+      llvm::report_fatal_error("Enum usage appears before definition");
+
+    DeclarationsUsed.insert(ED->getID());
 
     auto [Scopes, FullyScopedName] = GetScopes(ED);
     if (!FullyScopedName.empty())
@@ -2240,6 +2320,14 @@ private:
       return true;
 
     return false;
+  }
+
+  const FunctionDecl *
+  GetOriginalFunctionDeclFromInstantiation(const FunctionDecl *FD) const {
+    if (FD->isTemplateInstantiation())
+      return FD->getTemplateInstantiationPattern();
+
+    return FD;
   }
 };
 
