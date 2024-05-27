@@ -106,10 +106,16 @@ public:
       if (RD->getNameAsString() == "")
         return;
 
+      if (isFromStandardLibrary(RD))
+        return;
+
       if (isTemplatedDeclaration(RD))
         return;
 
       if (isNestedClass(RD))
+        return;
+
+      if (isDefinedInFunction(RD))
         return;
 
       std::string FileName = GetContainingFile(RD);
@@ -120,6 +126,12 @@ public:
     if (const ClassTemplateDecl *CTD =
             Result.Nodes.getNodeAs<clang::ClassTemplateDecl>(
                 "ClassTemplateDeclaration")) {
+      if (isNestedClass(CTD->getTemplatedDecl()))
+        return;
+
+      if (isFromStandardLibrary(CTD))
+        return;
+
       std::string FileName = GetContainingFile(CTD);
       if (inSubstitutedHeader(FileName))
         AddClassInfo(CTD, FileName);
@@ -127,6 +139,18 @@ public:
 
     if (const EnumDecl *ED =
             Result.Nodes.getNodeAs<clang::EnumDecl>("EnumDeclaration")) {
+      if (isFromStandardLibrary(ED))
+        return;
+
+      const DeclContext *DC = ED->getDeclContext();
+      if (const RecordDecl *RD = dyn_cast<RecordDecl>(DC)) {
+        if (isNestedClass(RD))
+          return;
+      }
+
+      if (const FunctionDecl *RD = dyn_cast<FunctionDecl>(DC))
+        return;
+
       std::string FileName = GetContainingFile(ED);
       if (inSubstitutedHeader(FileName))
         AddEnumInfo(ED, FileName);
@@ -137,6 +161,9 @@ public:
       if (isTemplateInstantiation(MD))
         return;
 
+      if (isFromStandardLibrary(MD))
+        return;
+
       if (MD->getParent()->isUnion())
         return;
 
@@ -144,6 +171,9 @@ public:
         return;
 
       if (isNestedClass(MD->getParent()))
+        return;
+
+      if (isDefinedInFunction(MD->getParent()))
         return;
 
       std::string FileName = GetContainingFile(MD);
@@ -160,6 +190,9 @@ public:
 
     if (const FunctionDecl *FD =
             Result.Nodes.getNodeAs<clang::FunctionDecl>("Function")) {
+      if (isFromStandardLibrary(FD))
+        return;
+
       std::string FileName = GetContainingFile(FD);
       if (inSubstitutedHeader(FileName) && !isTemplateInstantiation(FD))
         AddFunctionInfo(FD, FileName);
@@ -168,6 +201,12 @@ public:
     if (const FunctionTemplateDecl *FTD =
             Result.Nodes.getNodeAs<clang::FunctionTemplateDecl>(
                 "FunctionTemplate")) {
+      if (FTD->getNameAsString() == "")
+        return;
+
+      if (isFromStandardLibrary(FTD))
+        return;
+
       std::string FileName = GetContainingFile(FTD);
       std::string ClassName;
 
@@ -175,6 +214,14 @@ public:
       if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
         if (isTemplateInstantiation(RD))
           return;
+
+        if (isNestedClass(RD))
+          return;
+
+        // Lambdas generate implicit FunctionTemplateDecls
+        if (RD->isLambda())
+          return;
+
         ClassName = RD->getNameAsString();
       } else {
         ClassName = "";
@@ -330,14 +377,84 @@ private:
                TSK_ExplicitInstantiationDefinition;
   }
 
+  bool isDefinedInMainSourceFile(const Decl *D) const {
+    std::string FileName = GetContainingFile(D);
+
+    return SourcePaths.find(FileName) != SourcePaths.end();
+  }
+
+  bool isFromStandardLibrary(const Decl *D) const {
+    if (!D)
+      return false;
+
+    clang::SourceLocation loc = D->getBeginLoc();
+    clang::SourceManager &SM = D->getASTContext().getSourceManager();
+    clang::PresumedLoc presumedLoc = SM.getPresumedLoc(loc);
+
+    if (!presumedLoc.isValid())
+      return false;
+
+    llvm::StringRef filename = presumedLoc.getFilename();
+    if (filename.startswith("/usr/include/c++/") ||
+        filename.startswith("/usr/lib/gcc/")) {
+      return true;
+    }
+
+    return false;
+  }
+
+  const Decl *getTypeDecl(const QualType &QT) const {
+    const clang::Type *T = GetBaseType(QT).getTypePtr();
+
+    if (const clang::ElaboratedType *ET = dyn_cast<clang::ElaboratedType>(T))
+      T = ET->desugar().getTypePtr();
+
+    if (const SubstTemplateTypeParmType *STTPT =
+            dyn_cast<clang::SubstTemplateTypeParmType>(T)) {
+      clang::QualType replacedType = STTPT->getReplacementType();
+      T = replacedType->getAs<RecordType>();
+    }
+
+    if (const TemplateTypeParmType *TTPT =
+            dyn_cast<clang::TemplateTypeParmType>(T))
+      return TTPT->getDecl();
+
+    if (const clang::RecordType *RT = dyn_cast<clang::RecordType>(T))
+      return RT->getDecl();
+
+    if (const clang::EnumType *ET = dyn_cast<clang::EnumType>(T))
+      return ET->getDecl();
+
+    if (const clang::TemplateSpecializationType *TST =
+            dyn_cast<clang::TemplateSpecializationType>(T)) {
+      clang::TemplateName TN = TST->getTemplateName();
+
+      if (const clang::TemplateDecl *TD = TN.getAsTemplateDecl())
+        return TD;
+    }
+
+    if (const InjectedClassNameType *ICNT =
+            dyn_cast<clang::InjectedClassNameType>(T))
+      return ICNT->getDecl();
+
+    if (const clang::TypedefType *TT = dyn_cast<clang::TypedefType>(T))
+      return TT->getDecl();
+
+    if (const clang::AutoType *AT = dyn_cast<clang::AutoType>(T))
+      return getTypeDecl(AT->getDeducedType());
+
+    llvm::report_fatal_error("Could not get Decl for QualType");
+  }
+
   std::string GetParameterType(const QualType &QT,
                                const ASTContext &Context) const {
-    QualType CurrentQT = QT;
-
-    std::string CurrentTypename = QT.getAsString();
+    QualType BaseType = GetBaseType(QT).getUnqualifiedType();
+    std::string CurrentTypename = BaseType.getAsString();
     if (CurrentTypename.rfind("std::", 0) ==
         0) // pos=0 limits the search to the prefix)
       return CurrentTypename;
+
+    QualType CurrentQT = QT;
 
     const clang::Type *T;
     std::string OriginalTypeName = "";
@@ -346,7 +463,8 @@ private:
       T = CurrentQT.getDesugaredType(Context).getTypePtr();
 
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
-          T->isEnumeralType() || T->isConstantArrayType())
+          T->isEnumeralType() || T->isConstantArrayType() ||
+          T->isDependentSizedArrayType())
         return QT.getAsString();
 
       if (T->isRecordType()) {
@@ -364,6 +482,9 @@ private:
         CurrentQT = T->getPointeeType();
         continue;
       }
+
+      if (const AutoType *AT = T->getContainedAutoType())
+        return QT.getAsString();
 
       if (T->isFunctionProtoType()) {
         // This is meant for the following code:
@@ -422,6 +543,20 @@ private:
         } else if (const DependentNameType *DNT =
                        dyn_cast<clang::DependentNameType>(T)) {
           return CurrentQT.getAsString();
+        } else if (const DecltypeType *DR = dyn_cast<clang::DecltypeType>(T)) {
+          // This was added to handle the case
+          // ```
+          // decltype(std::declval<F>()(std::declval<mp_size_t<0>>())) call(
+          // std::size_t i, F && f )
+          // ```
+          // This works right now because this is a std:: type. If the
+          // decltype is of something defined in a substituted header,
+          // then this might not works
+          return CurrentQT.getAsString();
+        } else if (const DependentTemplateSpecializationType *DTST =
+                       dyn_cast<clang::DependentTemplateSpecializationType>(
+                           T)) {
+          return CurrentQT.getAsString();
         } else {
           const InjectedClassNameType *InjectedType =
               dyn_cast<clang::InjectedClassNameType>(T);
@@ -454,11 +589,17 @@ private:
       }
     }
 
+    const Decl *TypeDecl = getTypeDecl(CurrentQT.getDesugaredType(Context));
+    if (isFromStandardLibrary(TypeDecl))
+      return QT.getAsString();
+
     if (!(T->isRecordType() || T->isDependentType()))
       llvm::report_fatal_error(
           "Internal error, T must be a RecordType or DependentType");
 
-    std::string QualifiedType = QT.getAsString();
+    // std::string QualifiedType = QT.getAsString();
+    std::string QualifiedType =
+        QT.getDesugaredType(Context).getCanonicalType().getAsString();
 
     // Constructor return types start with "class " or "struct " due
     // to how we get the QualifiedType we want to return
@@ -469,8 +610,8 @@ private:
     else if (QualifiedType.compare(0, StructSubstr.size(), StructSubstr) == 0)
       QualifiedType = QualifiedType.substr(StructSubstr.size());
 
-    // If the type already contains the fully scoped name (plus some
-    // qualifiers), return it as is
+    // If the type already contains the fully scoped name (plus
+    // potentially some qualifiers), return it as is
     if (QualifiedType.find(FullyScopedName) != std::string::npos)
       return QualifiedType;
 
@@ -1183,25 +1324,7 @@ private:
     for (unsigned i = 0; i < TemplateArgs.size(); i++) {
       const TemplateArgument &arg = TemplateArgs[i];
       const NamedDecl *param = TemplateParams->getParam(i);
-      std::string ArgValue;
-
-      switch (arg.getKind()) {
-      case clang::TemplateArgument::Type:
-        ArgValue = arg.getAsType().getAsString();
-        break;
-      case clang::TemplateArgument::Integral:
-        ArgValue = llvm::toString(arg.getAsIntegral(), 10);
-        break;
-      case clang::TemplateArgument::Declaration:
-        ArgValue = arg.getAsDecl()->getNameAsString();
-        break;
-      case clang::TemplateArgument::NullPtr:
-        ArgValue = "nullptr";
-        break;
-      // Additional cases as necessary
-      default:
-        llvm::report_fatal_error("Unknown template arg");
-      }
+      std::string ArgValue = GetTemplateArgAsString(arg);
 
       result += ArgValue + ", ";
       auto [It, NewlyInserted] = ClassParameterToArgument.try_emplace(
@@ -1222,6 +1345,38 @@ private:
     return {result, ClassParameterToArgument};
   }
 
+  std::string GetTemplateArgAsString(const TemplateArgument &TA) const {
+    switch (TA.getKind()) {
+    case clang::TemplateArgument::Type:
+      return TA.getAsType().getAsString();
+      break;
+    case clang::TemplateArgument::Integral:
+      return llvm::toString(TA.getAsIntegral(), 10);
+      break;
+    case clang::TemplateArgument::Declaration:
+      return TA.getAsDecl()->getNameAsString();
+      break;
+    case clang::TemplateArgument::NullPtr:
+      return "nullptr";
+      break;
+    case clang::TemplateArgument::Pack: {
+      std::string PackedArgs = "";
+      for (const auto &PackedArg : TA.getPackAsArray()) {
+        PackedArgs += GetTemplateArgAsString(PackedArg) + ", ";
+      }
+
+      if (!PackedArgs.empty()) {
+        PackedArgs.pop_back();
+        PackedArgs.pop_back();
+      }
+
+      return PackedArgs;
+    } break;
+    default:
+      llvm::report_fatal_error("Unknown template arg");
+    }
+  }
+
   std::pair<std::string, std::unordered_map<std::string, std::string>>
   GetTemplateArgs(const FunctionTemplateSpecializationInfo *FTSI) const {
     std::string result = "";
@@ -1238,25 +1393,7 @@ private:
     for (unsigned i = 0; i < TemplateArgs->size(); i++) {
       const TemplateArgument &arg = TemplateArgs->get(i);
       const NamedDecl *param = TemplateParams->getParam(i);
-      std::string ArgValue;
-
-      switch (arg.getKind()) {
-      case clang::TemplateArgument::Type:
-        ArgValue = arg.getAsType().getAsString();
-        break;
-      case clang::TemplateArgument::Integral:
-        ArgValue = llvm::toString(arg.getAsIntegral(), 10);
-        break;
-      case clang::TemplateArgument::Declaration:
-        ArgValue = arg.getAsDecl()->getNameAsString();
-        break;
-      case clang::TemplateArgument::NullPtr:
-        ArgValue = "nullptr";
-        break;
-      // Additional cases as necessary
-      default:
-        llvm::report_fatal_error("Unknown template arg");
-      }
+      std::string ArgValue = GetTemplateArgAsString(arg);
 
       result += ArgValue + ", ";
       auto [It, NewlyInserted] = FunctionParameterToArgument.try_emplace(
@@ -1279,6 +1416,13 @@ private:
 
   void AddClassUsage(const DeclaratorDecl *DD, const std::string &FileName) {
     QualType Type = GetBaseType(DD->getType().getUnqualifiedType());
+
+    if (Type->isTemplateTypeParmType() || Type->isBuiltinType())
+      return;
+
+    const Decl *TypeDecl = getTypeDecl(Type);
+    if (isFromStandardLibrary(TypeDecl) || isDefinedInMainSourceFile(TypeDecl))
+      return;
 
     auto [Scopes, FullyScopedName] = GetScopes(Type);
     if (!FullyScopedName.empty())
@@ -1422,6 +1566,22 @@ private:
                        const std::string &FullyScopedClassName = "") {
     std::string Name = FD->getNameAsString();
 
+    // This condition is triggered in the following context
+    // ```
+    // stream(stream&&) = default;
+    // ...
+    // template<class... Args>
+    // explicit
+    // stream(Args&&... args);
+    // ```
+    // This happens in websocket_server_async.cpp, where name is
+    // stream<type-parameter-0-0, >, but for some reason this is not
+    // so when we get the call to the constructor later on (it doesn't
+    // have the '<' and '>'). So I'm just gonna remove them here for now
+    if (Name == "stream<type-parameter-0-0, >") {
+      Name = "stream<NextLayer, deflateSupported>";
+    }
+
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
@@ -1461,6 +1621,22 @@ private:
                        const std::string &FileName,
                        const std::string &ClassName = "") {
     std::string Name = FTD->getNameAsString();
+
+    // This condition is triggered in the following context
+    // ```
+    // stream(stream&&) = default;
+    // ...
+    // template<class... Args>
+    // explicit
+    // stream(Args&&... args);
+    // ```
+    // This happens in websocket_server_async.cpp, where name is
+    // stream<type-parameter-0-0, >, but for some reason this is not
+    // so when we get the call to the constructor later on (it doesn't
+    // have the '<' and '>'). So I'm just gonna remove them here for now
+    if (Name == "stream<type-parameter-0-0, >") {
+      Name = "stream<NextLayer, deflateSupported>";
+    }
 
     auto [Scopes, FullyScopedName] = GetScopes(FTD);
     if (!FullyScopedName.empty())
@@ -1616,6 +1792,9 @@ private:
   void AddFunctionUsage(const CallExpr *CE) {
     const FunctionDecl *FD = CE->getDirectCallee();
 
+    if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
+      return;
+
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
@@ -1705,9 +1884,13 @@ private:
   void AddConstructorUsage(const CXXConstructExpr *CE) {
     const CXXConstructorDecl *FD = CE->getConstructor();
 
+    if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
+      return;
+
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
+
     FullyScopedName += FD->getNameAsString();
 
     // Represents the <T, U, ...> at the end of a constructor
@@ -1874,8 +2057,9 @@ private:
   std::pair<std::vector<TypeScope>, std::string>
   GetScopes(QualType Type) const {
     const RecordType *RT = Type->getAs<RecordType>();
-    if (RT == nullptr)
+    if (RT == nullptr) {
       llvm::report_fatal_error("RecordType cannot be nullptr");
+    }
 
     const RecordDecl *RD = RT->getDecl();
     return GetScopes(RD);
@@ -1891,8 +2075,18 @@ private:
         Scopes.emplace(Scopes.begin(), NS->getNameAsString(),
                        TypeScope::ScopeType::NamespaceScope);
       } else if (const RecordDecl *RD = dyn_cast<RecordDecl>(DC)) {
-        Scopes.emplace(Scopes.begin(), RD->getNameAsString(),
-                       TypeScope::ScopeType::ClassScope);
+        std::string Name = RD->getNameAsString();
+        if (isTemplatedDeclaration(RD)) {
+          const TemplateDecl *TD;
+          if (const ClassTemplateSpecializationDecl *CTSD =
+                  dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+            TD = CTSD->getSpecializedTemplate();
+          } else {
+            TD = RD->getDescribedTemplate();
+          }
+          Name += GetTemplateTypenames(TD, false);
+        }
+        Scopes.emplace(Scopes.begin(), Name, TypeScope::ScopeType::ClassScope);
       } else if (DC->getDeclKind() == Decl::Kind::UnresolvedUsingValue) {
         break;
       } else if (DC->getDeclKind() == Decl::Kind::LinkageSpec) {
@@ -1929,6 +2123,17 @@ private:
       return false;
 
     if (const RecordDecl *ParentClass = dyn_cast<RecordDecl>(DC))
+      return true;
+
+    return false;
+  }
+
+  bool isDefinedInFunction(const RecordDecl *RD) const {
+    const DeclContext *DC = RD->getDeclContext();
+    if (!DC)
+      return false;
+
+    if (const FunctionDecl *ParentFunction = dyn_cast<FunctionDecl>(DC))
       return true;
 
     return false;
