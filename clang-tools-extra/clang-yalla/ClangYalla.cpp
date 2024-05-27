@@ -340,7 +340,8 @@ private:
     if (HeaderDirectoryPath == "")
       return Filename == HeaderPath;
 
-    return Filename.find(HeaderDirectoryPath) != std::string::npos;
+    return getAbsolutePath(llvm::StringRef(Filename))
+               .find(HeaderDirectoryPath) != std::string::npos;
   }
 
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
@@ -459,12 +460,13 @@ private:
     const clang::Type *T;
     std::string OriginalTypeName = "";
     std::string FullyScopedName = "";
+
     while (!CurrentQT.isNull()) {
       T = CurrentQT.getDesugaredType(Context).getTypePtr();
 
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
           T->isEnumeralType() || T->isConstantArrayType() ||
-          T->isDependentSizedArrayType())
+          T->isDependentSizedArrayType() || T->isVectorType())
         return QT.getAsString();
 
       if (T->isRecordType()) {
@@ -535,8 +537,28 @@ private:
                 dyn_cast<clang::TemplateSpecializationType>(T)) {
           clang::TemplateName TN = TST->getTemplateName();
 
-          if (clang::TemplateDecl *TD = TN.getAsTemplateDecl())
+          if (clang::TemplateDecl *TD = TN.getAsTemplateDecl()) {
+            const NamedDecl *ND = TD->getTemplatedDecl();
+            if (!ND) {
+              // Needed for eigen example geo_hyperplane.cpp, for this
+              // case (getting "const StorageBase<OtherDerived>&")"
+              // ```
+              // template <typename ExpressionType, template <typename> class
+              // StorageBase> class NoAlias {
+              //   template <typename OtherDerived>
+              //   EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE ExpressionType&
+              //   operator=(const StorageBase<OtherDerived>& other) {
+              //     call_assignment_no_alias(m_expression, other.derived(),
+              //                              internal::assign_op<Scalar,
+              //                              typename OtherDerived::Scalar>());
+              //     return m_expression;
+              //   }
+              // ```
+              return QT.getAsString();
+            }
+
             RD = dyn_cast<clang::CXXRecordDecl>(TD->getTemplatedDecl());
+          }
         } else if (const clang::PackExpansionType *PET =
                        dyn_cast<clang::PackExpansionType>(T)) {
           return CurrentQT.getAsString();
@@ -733,6 +755,63 @@ private:
     }
 
     return Signature + "{\n" + WrapperBody + "}\n";
+  }
+
+  void
+  AddImplicitDefaultConstructorWrapper(const CXXRecordDecl *RD,
+                                       const std::string &ClassName,
+                                       const std::string &FullyScopedClassName,
+                                       std::vector<TypeScope> &&Scopes) {
+    std::string WrapperName = "Wrapper_" + ClassName;
+
+    const clang::Type *T = RD->getTypeForDecl();
+
+    QualType ClassType = T->getCanonicalTypeInternal();
+    std::string WrapperReturnType =
+        GetParameterType(ClassType, RD->getASTContext()) + "*";
+    bool ReturnsClassByValue = false;
+
+    const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+    if (CTD == nullptr)
+      llvm::report_fatal_error(
+          "Do not add default constructor wrappers for non templates");
+
+    std::string TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
+
+    // The template arguments are going to be used to invoke the
+    // function being wrapped. The only situation where we would
+    // want to specify the template argument in the function
+    // call is in the constructor.
+    std::string TemplateArguments = GetTemplateTypenames(CTD, false);
+
+    std::string FullyScopedName = FullyScopedClassName + TemplateArguments +
+                                  "::" + ClassName + TemplateArguments;
+
+    // All of these are empty since this is a default constructor
+    std::string Parameters = "()";
+    std::vector<std::string> FunctionParameters;
+    std::vector<std::string> FunctionParameterTypes;
+
+    std::string WrapperFunctionSignature =
+        TemplateTypenames + WrapperReturnType + " " + WrapperName + Parameters;
+    std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
+        WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
+        ClassName, FullyScopedName, FullyScopedClassName,
+        WrapperInfo::Constructor, std::move(FunctionParameters),
+        std::move(TemplateArguments));
+
+    WrapperFunctionDefinitions.insert(WrapperFunctionDefinition);
+
+    FunctionForwardDeclarations += WrapperFunctionSignature + ";\n";
+    FunctionWrappers.try_emplace(
+        FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
+        std::move(Parameters), std::move(WrapperFunctionDefinition),
+        std::move(FunctionParameterTypes));
+
+    auto [FI, NewlyInserted] = Functions.try_emplace(
+        FullyScopedName, RD->getNameAsString(), GetContainingFile(RD),
+        ClassName, true, true, std::move(Scopes), nullptr,
+        CharSourceRange::getCharRange(RD->getBeginLoc(), RD->getEndLoc()));
   }
 
   void AddFunctionWrapper(const FunctionDecl *FD,
@@ -1198,6 +1277,26 @@ private:
     if (!NewlyInserted) {
       CI->second.HasDefinition |= HasDefinition;
     }
+
+    // Templated classes that do not explicitly define a default
+    // constructor will not have a constructor wrapper generated later
+    // (not sure why). This fixes that.
+
+    clang::CXXRecordDecl *RD = CTD->getTemplatedDecl();
+
+    // Check potential constructors in the template definition
+    bool DefaultConstructorIsDefined = false;
+    for (const auto *ctor : RD->ctors()) {
+      if (ctor->isDefaultConstructor() && !ctor->isDeleted()) {
+        DefaultConstructorIsDefined = true;
+        break;
+      }
+    }
+
+    auto [ScopesTemp, FullyScopedNameTemp] = GetScopes(CTD);
+    if (!DefaultConstructorIsDefined)
+      AddImplicitDefaultConstructorWrapper(RD, Name, FullyScopedName,
+                                           std::move(Scopes));
   }
 
   void AddEnumInfo(const EnumDecl *ED, const std::string &FileName) {
@@ -1977,6 +2076,10 @@ private:
       return;
 
     const EnumDecl *ED = llvm::dyn_cast<EnumDecl>(DC);
+
+    if (isDefinedInMainSourceFile(ED))
+      return;
+
     auto [Scopes, FullyScopedName] = GetScopes(ED);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
