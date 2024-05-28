@@ -40,6 +40,13 @@ static llvm::cl::opt<std::string> HeaderDirectoryCLI(
     llvm::cl::desc("The directory containing the headers to be substituted"),
     llvm::cl::value_desc("PATH_TO_HEADER_DIR"), llvm::cl::Optional);
 
+static llvm::cl::list<std::string> InputHeadersCLI(
+    "input_headers",
+    llvm::cl::desc(
+        "The headers that are part of the source (not to be substituted)"),
+    llvm::cl::ZeroOrMore, llvm::cl::value_desc("PATH_TO_INPUT_HEADER"),
+    llvm::cl::CommaSeparated, llvm::cl::Optional);
+
 using namespace clang;
 using namespace clang::ast_matchers;
 
@@ -87,9 +94,11 @@ public:
   YallaMatcher(const std::unordered_set<std::string> &SourcePaths,
                const std::string &HeaderPath,
                const std::string &HeaderDirectoryPath,
+               const std::unordered_set<std::string> &InputHeaderPaths,
                std::map<std::string, Replacements> &Replace)
       : SourcePaths(SourcePaths), HeaderPath(HeaderPath),
-        HeaderDirectoryPath(HeaderDirectoryPath), Replace(Replace) {}
+        HeaderDirectoryPath(HeaderDirectoryPath),
+        InputHeaderPaths(InputHeaderPaths), Replace(Replace) {}
 
   virtual void onEndOfTranslationUnit() override {
     std::string AllForwardDeclarations = "";
@@ -264,6 +273,10 @@ public:
     if (const CallExpr *CE =
             Result.Nodes.getNodeAs<clang::CallExpr>("FunctionCall")) {
       std::string FileName = GetContainingFile(CE);
+
+      if (isCallToLambda(CE))
+        return;
+
       if (SourcePaths.find(FileName) != SourcePaths.end())
         AddFunctionUsage(CE);
     }
@@ -343,6 +356,7 @@ private:
   const std::unordered_set<std::string> &SourcePaths;
   const std::string &HeaderPath;
   const std::string &HeaderDirectoryPath;
+  const std::unordered_set<std::string> &InputHeaderPaths;
   std::map<std::string, Replacements> &Replace;
   SourceLocation loc;
   std::string MainFilename;
@@ -406,7 +420,8 @@ private:
   bool isDefinedInMainSourceFile(const Decl *D) const {
     std::string FileName = GetContainingFile(D);
 
-    return SourcePaths.find(FileName) != SourcePaths.end();
+    return SourcePaths.find(FileName) != SourcePaths.end() ||
+           InputHeaderPaths.find(FileName) != InputHeaderPaths.end();
   }
 
   bool isFromStandardLibrary(const Decl *D) const {
@@ -2261,12 +2276,14 @@ private:
         std::string Name = RD->getNameAsString();
         if (isTemplatedDeclaration(RD)) {
           const TemplateDecl *TD;
+
           if (const ClassTemplateSpecializationDecl *CTSD =
                   dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
             TD = CTSD->getSpecializedTemplate();
           } else {
             TD = RD->getDescribedTemplate();
           }
+
           Name += GetTemplateTypenames(TD, false);
         }
         Scopes.emplace(Scopes.begin(), Name, TypeScope::ScopeType::ClassScope);
@@ -2329,6 +2346,27 @@ private:
 
     return FD;
   }
+
+  bool isCallToLambda(const clang::CallExpr *CE) {
+    if (CE) {
+      const clang::Expr *Callee = CE->getCallee();
+
+      if (Callee) {
+        clang::QualType CalleeType = Callee->getType();
+
+        if (CalleeType->isFunctionPointerType()) {
+          const clang::PointerType *PT =
+              CalleeType->getAs<clang::PointerType>();
+          CalleeType = PT->getPointeeType();
+        }
+
+        if (CalleeType->isFunctionProtoType())
+          return true;
+      }
+    }
+
+    return false;
+  }
 };
 
 int main(int argc, const char **argv) {
@@ -2358,12 +2396,15 @@ int main(int argc, const char **argv) {
       HeaderDirectoryCLI.empty()
           ? ""
           : getAbsolutePath(HeaderDirectoryCLI.getValue());
+  std::unordered_set<std::string> InputHeaders;
+  for (const std::string &Header : InputHeadersCLI)
+    InputHeaders.insert(getAbsolutePath(Header));
 
   RefactoringTool Tool(OptionsParser.getCompilations(),
                        OptionsParser.getSourcePathList());
 
   YallaMatcher YM(SourcePaths, HeaderAbsolutePath, HeaderDirectoryAbsolutePath,
-                  Tool.getReplacements());
+                  InputHeaders, Tool.getReplacements());
   MatchFinder Finder;
   Finder.addMatcher(ClassMatcher, &YM);
   Finder.addMatcher(ClassTemplateMatcher, &YM);
