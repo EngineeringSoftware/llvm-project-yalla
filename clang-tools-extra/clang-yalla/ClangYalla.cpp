@@ -86,7 +86,7 @@ DeclarationMatcher FunctionMatcher = anyOf(
 StatementMatcher FunctionCallMatcher =
     anyOf(callExpr().bind("FunctionCall"),
           cxxConstructExpr().bind("ConstructorCall"));
-StatementMatcher EnumConsantUsage =
+StatementMatcher EnumConstantUsage =
     declRefExpr(to(enumConstantDecl())).bind("EnumConstantUsage");
 
 class YallaMatcher : public MatchFinder::MatchCallback {
@@ -259,14 +259,14 @@ public:
     if (const FieldDecl *FD =
             Result.Nodes.getNodeAs<clang::FieldDecl>("Field")) {
       std::string FileName = GetContainingFile(FD);
-      if (SourcePaths.find(FileName) != SourcePaths.end())
+      if (isDefinedInMainSourceFile(FileName))
         AddClassUsage(FD, FileName);
     }
 
     if (const VarDecl *VD =
             Result.Nodes.getNodeAs<clang::VarDecl>("Variable")) {
       std::string FileName = GetContainingFile(VD);
-      if (SourcePaths.find(FileName) != SourcePaths.end())
+      if (isDefinedInMainSourceFile(FileName))
         AddClassUsage(VD, FileName);
     }
 
@@ -274,10 +274,10 @@ public:
             Result.Nodes.getNodeAs<clang::CallExpr>("FunctionCall")) {
       std::string FileName = GetContainingFile(CE);
 
-      if (isCallToLambda(CE))
+      if (isCallToLambda(CE) && !dyn_cast<CXXOperatorCallExpr>(CE))
         return;
 
-      if (SourcePaths.find(FileName) != SourcePaths.end())
+      if (isDefinedInMainSourceFile(FileName))
         AddFunctionUsage(CE);
     }
 
@@ -285,7 +285,7 @@ public:
             Result.Nodes.getNodeAs<clang::CXXConstructExpr>(
                 "ConstructorCall")) {
       std::string FileName = GetContainingFile(CE);
-      if (SourcePaths.find(FileName) != SourcePaths.end())
+      if (isDefinedInMainSourceFile(FileName))
         AddConstructorUsage(CE);
     }
 
@@ -294,7 +294,7 @@ public:
       if (const EnumConstantDecl *ECD =
               dyn_cast<EnumConstantDecl>(DRE->getDecl())) {
         std::string FileName = GetContainingFile(DRE);
-        if (SourcePaths.find(FileName) != SourcePaths.end())
+        if (isDefinedInMainSourceFile(FileName))
           AddEnumConstantUsage(DRE, ECD, FileName);
       }
     }
@@ -363,6 +363,7 @@ private:
   SourceManager *SM;
   std::unordered_map<std::string, WrapperInfo> FunctionWrappers;
   const std::string YallaObject = "yalla_object";
+  const std::string YallaObjectTemplateTypename = "YallaObjectParameterType";
   std::unordered_set<std::string> ClassTemplateInstantiations;
   std::unordered_set<std::string> FunctionTemplateInstantiations;
 
@@ -420,6 +421,10 @@ private:
   bool isDefinedInMainSourceFile(const Decl *D) const {
     std::string FileName = GetContainingFile(D);
 
+    return isDefinedInMainSourceFile(FileName);
+  }
+
+  bool isDefinedInMainSourceFile(std::string FileName) const {
     return SourcePaths.find(FileName) != SourcePaths.end() ||
            InputHeaderPaths.find(FileName) != InputHeaderPaths.end();
   }
@@ -491,6 +496,13 @@ private:
                                const ASTContext &Context) const {
     QualType BaseType = GetBaseType(QT).getUnqualifiedType();
     std::string CurrentTypename = BaseType.getAsString();
+
+    // This is the return type of the view access operator
+    if ((CurrentTypename.rfind("std::enable_if_t", 0) == 0) &&
+        CurrentTypename.find("Kokkos") !=
+            std::string::npos) // pos=0 limits the search to the prefix)
+      return "int";
+
     if (CurrentTypename.rfind("std::", 0) ==
         0) // pos=0 limits the search to the prefix)
       return CurrentTypename;
@@ -619,9 +631,16 @@ private:
                        dyn_cast<clang::DependentTemplateSpecializationType>(
                            T)) {
           return CurrentQT.getAsString();
+        } else if (const UnresolvedUsingType *UUT =
+                       dyn_cast<clang::UnresolvedUsingType>(T)) {
+          llvm::report_fatal_error("Cannot handle unresolved using types here");
         } else {
           const InjectedClassNameType *InjectedType =
               dyn_cast<clang::InjectedClassNameType>(T);
+
+          if (!InjectedType)
+            llvm::report_fatal_error(
+                "Could not get the parameter's type as string");
 
           RD = InjectedType->getDecl();
         }
@@ -886,7 +905,14 @@ private:
       else
         WrapperType = WrapperInfo::Function;
 
-      WrapperName = "Wrapper_" + FD->getNameAsString();
+      std::string OriginalName;
+      if (FD->isOverloadedOperator())
+        OriginalName = "Operator_" + GetOverloadedOperatorAsString(
+                                         FD->getOverloadedOperator());
+      else
+        OriginalName = FD->getNameAsString();
+
+      WrapperName = "Wrapper_" + OriginalName;
       QualType ReturnType = FD->getReturnType();
 
       WrapperReturnType = GetParameterType(ReturnType, FD->getASTContext());
@@ -913,10 +939,23 @@ private:
         if (CTD) {
           TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
 
+          // We still want to add the yalla object template type parameter
+          std::string ReplaceWith =
+              "template <typename " + YallaObjectTemplateTypename + ", ";
+          std::string ToReplace = "template <";
+          std::size_t ReplaceLoc = TemplateTypenames.find(ToReplace);
+
+          if (ReplaceLoc == std::string::npos)
+            llvm::report_fatal_error("Something went wrong in adding wrapper");
+
+          TemplateTypenames.replace(ReplaceLoc, ToReplace.length(),
+                                    ReplaceWith);
+
           // The template arguments are going to be used to invoke the
           // function being wrapped. The only situation where we would
           // want to specify the template argument in the function
-          // call is in the constructor.
+          // call is in the constructor. This is used in the wrapper
+          // definition to call the original constructor
           if (WrapperType == WrapperInfo::Constructor)
             TemplateArguments = GetTemplateTypenames(CTD, false);
         }
@@ -970,7 +1009,14 @@ private:
       else
         WrapperType = WrapperInfo::Function;
 
-      WrapperName = "Wrapper_" + FD->getNameAsString();
+      std::string OriginalName;
+      if (FD->isOverloadedOperator())
+        OriginalName = "Operator_" + GetOverloadedOperatorAsString(
+                                         FD->getOverloadedOperator());
+      else
+        OriginalName = FD->getNameAsString();
+
+      WrapperName = "Wrapper_" + OriginalName;
       WrapperReturnType = GetParameterType(ReturnType, FTD->getASTContext());
 
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
@@ -1080,27 +1126,7 @@ private:
     // Add the first argument as yalla_object if FD is a method, while
     // making sure to add template params e.g. <T, U, ...>
     if (FD->isCXXClassMember() && !clang::isa<CXXConstructorDecl>(FD)) {
-      std::string TemplateParams = "";
-      const DeclContext *DC = FD->getDeclContext();
-      if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-        const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
-
-        if (CTD) {
-          for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
-            std::string TypenameType;
-            TemplateParams += ND->getNameAsString() + ", ";
-          }
-
-          // Remove the ', '
-          if (!TemplateParams.empty()) {
-            TemplateParams.pop_back();
-            TemplateParams.pop_back();
-          }
-          TemplateParams = "<" + TemplateParams + ">";
-        }
-      }
-
-      Parameters += ClassName + TemplateParams + "* " + YallaObject + ", ";
+      Parameters += YallaObjectTemplateTypename + "* " + YallaObject + ", ";
       FunctionArguments.emplace_back(YallaObject);
       FunctionArgumentTypes.emplace_back(ClassName);
     }
@@ -1172,23 +1198,14 @@ private:
           const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
           if (CTD) {
-            for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
+            std::string TypenameType;
+            if (AsParameters)
+              TypenameType = "typename ";
+            else
+              TypenameType = "";
 
-              std::string TypenameType;
-              if (AsParameters) {
-                if (const NonTypeTemplateParmDecl *NTTP =
-                        dyn_cast<NonTypeTemplateParmDecl>(ND)) {
-                  QualType ParamType = NTTP->getType();
-                  TypenameType = ParamType.getAsString() + " ";
-                } else {
-                  TypenameType = "typename ";
-                }
-              } else {
-                TypenameType = "";
-              }
-
-              TemplateTypenames += TypenameType + ND->getNameAsString() + ", ";
-            }
+            TemplateTypenames +=
+                TypenameType + YallaObjectTemplateTypename + ", ";
           }
         }
       }
@@ -1200,14 +1217,29 @@ private:
         if (const NonTypeTemplateParmDecl *NTTP =
                 dyn_cast<NonTypeTemplateParmDecl>(ND)) {
           QualType ParamType = NTTP->getType();
-          TypenameType = ParamType.getAsString() + " ";
+          TypenameType = ParamType.getAsString();
         } else {
-          TypenameType = "typename ";
+          TypenameType = "typename";
         }
       } else {
         TypenameType = "";
       }
-      TemplateTypenames += TypenameType + ND->getNameAsString() + ", ";
+
+      std::string ParameterName = ND->getNameAsString();
+
+      if (ND->isParameterPack()) {
+        if (AsParameters)
+          TypenameType += "... ";
+        else {
+          TypenameType += " ";
+          ParameterName += "...";
+        }
+      }
+
+      if (AsParameters && TypenameType[TypenameType.size() - 1] != ' ')
+        TypenameType += " ";
+
+      TemplateTypenames += TypenameType + ParameterName + ", ";
     }
 
     // Remove the ', '
@@ -1409,8 +1441,13 @@ private:
       if (const ClassTemplateSpecializationDecl *CTSD =
               dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
         auto [ClassTemplateArgs, ClassTemplateParamMap] = GetTemplateArgs(CTSD);
-        result = ClassTemplateArgs.substr(1, ClassTemplateArgs.size() - 2) +
-                 ", "; // remove the < and >
+        auto [Scopes, FullyScopedName] = GetScopes(RD);
+        if (!FullyScopedName.empty())
+          FullyScopedName += "::";
+        FullyScopedName += RD->getNameAsString();
+        result = FullyScopedName + ClassTemplateArgs;
+        // result = ClassTemplateArgs.substr(1, ClassTemplateArgs.size() - 2) +
+        //          ", "; // remove the < and >
         TemplateParameterToArgument.insert(ClassTemplateParamMap.begin(),
                                            ClassTemplateParamMap.end());
       }
@@ -1613,7 +1650,8 @@ private:
                            Range);
 
     if (DeclarationsSeen.count(CI.RD->getID()) == 0)
-      llvm::report_fatal_error("Class usage appears before definition");
+      llvm::report_fatal_error(
+          "Class usage appears before definition (ID not found)");
 
     DeclarationsUsed.insert(CI.RD->getID());
 
@@ -1669,7 +1707,8 @@ private:
 
         auto it = FunctionWrappers.find(FullyScopedName);
         if (it == FunctionWrappers.end())
-          llvm::report_fatal_error("Found Constructor usage before definition");
+          llvm::report_fatal_error(
+              "Found Constructor usage before definition (in class usage)");
 
         std::string WrapperName = it->second.WrapperName;
         auto [ReplaceWith, WrapperArgumentTypes] =
@@ -1730,7 +1769,54 @@ private:
           auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
           ClassTemplateInstantiations.insert(
               "template class " + FullyScopedName + ClassTemplateArgs + ";\n");
+
+          AddTemplateArgsToUsages(CTSD->getTemplateArgs().asArray());
         }
+      }
+    }
+  }
+
+  void AddTemplateArgsToUsages(const llvm::ArrayRef<TemplateArgument> &TAL) {
+    for (const TemplateArgument &TA : TAL) {
+      switch (TA.getKind()) {
+      case clang::TemplateArgument::Type: {
+        QualType QT = GetBaseType(TA.getAsType().getUnqualifiedType());
+        const RecordType *RT = QT->getAs<RecordType>();
+
+        if (!RT)
+          continue;
+
+        const RecordDecl *RD = RT->getDecl();
+
+        std::string FileName = GetContainingFile(RD);
+        if (!inSubstitutedHeader(FileName))
+          continue;
+
+        auto [Scopes, FullyScopedName] = GetScopes(QT);
+        if (!FullyScopedName.empty())
+          FullyScopedName += "::";
+        FullyScopedName += GetUnscopedName(QT);
+
+        auto it = Classes.find(FullyScopedName);
+        if (it == Classes.end())
+          llvm::report_fatal_error(
+              "Found class usage before definition (in template args)");
+
+        // Get the proper ID if this is a templated class
+        if (const ClassTemplateSpecializationDecl *CTSD =
+                dyn_cast<ClassTemplateSpecializationDecl>(RD))
+          RD = CTSD->getSpecializedTemplate()->getTemplatedDecl();
+
+        if (DeclarationsSeen.count(RD->getID()) == 0)
+          llvm::report_fatal_error(
+              "Class usage appears before definition (in template args)");
+
+        DeclarationsUsed.insert(RD->getID());
+        break;
+      }
+      case clang::TemplateArgument::Pack:
+        AddTemplateArgsToUsages(TA.getPackAsArray());
+        break;
       }
     }
   }
@@ -1760,6 +1846,9 @@ private:
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
     FullyScopedName += Name;
+
+    if (hasUnresolvedUsingParamType(FD))
+      return;
 
     bool NeedsWrapper = FunctionNeedsWrapper(FD);
     if (NeedsWrapper)
@@ -1975,6 +2064,10 @@ private:
     if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
       return;
 
+    if (hasUnresolvedUsingParamType(FD))
+      llvm::report_fatal_error(
+          "Using a function that has an unresolved parameter type");
+
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
       FullyScopedName += "::";
@@ -2098,7 +2191,8 @@ private:
 
     if (isTemplateInstantiation(FD)) {
       if (TemplatedFunctions.find(FullyScopedName) == TemplatedFunctions.end())
-        llvm::report_fatal_error("Found constructor usage before definition");
+        llvm::report_fatal_error(
+            "Found template constructor usage before definition");
     } else {
       if (Functions.find(FullyScopedName) == Functions.end())
         llvm::report_fatal_error("Found constructor usage before definition");
@@ -2360,9 +2454,31 @@ private:
           CalleeType = PT->getPointeeType();
         }
 
+        // The operator() method of views is used with enable_if. This
+        // affects this logic
+        if (CalleeType.getAsString().find("std::enable_if_t") !=
+            std::string::npos)
+          return false;
+
         if (CalleeType->isFunctionProtoType())
           return true;
       }
+    }
+
+    return false;
+  }
+
+  bool hasUnresolvedUsingParamType(const FunctionDecl *FD) const {
+    for (const auto &Param : FD->parameters()) {
+      QualType QT = GetBaseType(Param->getType()).getUnqualifiedType();
+
+      const clang::Type *T =
+          QT.getDesugaredType(FD->getASTContext()).getTypePtr();
+      if (!T)
+        llvm::report_fatal_error("T cannot be nullptr at this point");
+
+      if (dyn_cast<clang::UnresolvedUsingType>(T))
+        return true;
     }
 
     return false;
@@ -2412,16 +2528,16 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(ClassUsageMatcher, &YM);
   Finder.addMatcher(FunctionMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);
-  Finder.addMatcher(EnumConsantUsage, &YM);
+  Finder.addMatcher(EnumConstantUsage, &YM);
 
   auto result = Tool.run(newFrontendActionFactory(&Finder).get());
 
-  std::cout << "Classes:\n";
-  YM.PrintClasses();
-  std::cout << "Functions:\n";
-  YM.PrintFunctions();
-  std::cout << "Templated Functions:\n";
-  YM.PrintTemplatedFunctions();
+  // std::cout << "Classes:\n";
+  // YM.PrintClasses();
+  // std::cout << "Functions:\n";
+  // YM.PrintFunctions();
+  // std::cout << "Templated Functions:\n";
+  // YM.PrintTemplatedFunctions();
 
   IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts = new DiagnosticOptions();
   DiagnosticsEngine Diagnostics(
