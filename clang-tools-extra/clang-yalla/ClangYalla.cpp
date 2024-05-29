@@ -1137,8 +1137,12 @@ private:
           GetParameterType(Param->getType(), FD->getASTContext());
       std::string ArgumentDereference = "";
       if ((ForWrapper && Param->getType()->isRecordType()) ||
+          (ForWrapper && Param->getType()->isReferenceType()) ||
           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
                              ParametersThatCanBeRecordTypes.end())) {
+        if (Param->getType()->isReferenceType())
+          std::replace(ParamType.begin(), ParamType.end(), '&', ' ');
+
         ParamType += "*";
         ArgumentDereference = "*"; // Need to dereference the parameter that we
                                    // are making into a pointer
@@ -1310,6 +1314,13 @@ private:
       FullyScopedName += "::";
     FullyScopedName += Name;
 
+    int64_t ID;
+    const RecordDecl *Definition = RD->getDefinition();
+    if (Definition)
+      ID = Definition->getID();
+    else
+      ID = RD->getID();
+
     if (Classes.find(FullyScopedName) == Classes.end()) {
       std::string ForwardDeclaration =
           GenerateClassForwardDeclaration(RD, Scopes);
@@ -1318,11 +1329,10 @@ private:
       MainFilename = FileName;
       SM = &(RD->getASTContext().getSourceManager());
 
-      ClassForwardDeclarations[RD->getID()].push_back(
-          std::move(ForwardDeclaration));
+      ClassForwardDeclarations[ID].push_back(std::move(ForwardDeclaration));
     }
 
-    DeclarationsSeen.insert(RD->getID());
+    DeclarationsSeen.insert(ID);
 
     CharSourceRange Range =
         CharSourceRange::getCharRange(RD->getBeginLoc(), RD->getEndLoc());
@@ -1452,6 +1462,9 @@ private:
                                            ClassTemplateParamMap.end());
       }
     }
+
+    if (!result.empty())
+      result += ", ";
 
     const FunctionTemplateSpecializationInfo *FTSI =
         FD->getTemplateSpecializationInfo();
@@ -1649,11 +1662,18 @@ private:
                            Type->isReferenceType() || Type->isPointerType(), DD,
                            Range);
 
-    if (DeclarationsSeen.count(CI.RD->getID()) == 0)
+    int64_t ID;
+    const RecordDecl *Definition = CI.RD->getDefinition();
+    if (Definition)
+      ID = Definition->getID();
+    else
+      ID = CI.RD->getID();
+
+    if (DeclarationsSeen.count(ID) == 0)
       llvm::report_fatal_error(
           "Class usage appears before definition (ID not found)");
 
-    DeclarationsUsed.insert(CI.RD->getID());
+    DeclarationsUsed.insert(ID);
 
     if (const VarDecl *VD = clang::dyn_cast<clang::VarDecl>(DD)) {
       if (!VD->hasInit())
