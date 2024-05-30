@@ -120,8 +120,13 @@ public:
     }
 
     if (AllForwardDeclarations != "") {
-      Replace[MainFilename].add(
-          Replacement(*SM, loc, 0, AllForwardDeclarations));
+      // Replace[MainFilename].add(
+      //     Replacement(*SM, loc, 0, AllForwardDeclarations));
+      std::ofstream outfile;
+
+      outfile.open("decls.cpp",
+                   std::ios_base::app); // append instead of overwrite
+      outfile << AllForwardDeclarations;
     }
   }
 
@@ -386,6 +391,24 @@ private:
                .find(HeaderDirectoryPath) != std::string::npos;
   }
 
+  // bool inSubstitutedHeader(QualType Type) const {
+  //   const clang::Type* T = GetBaseTypePtr(Type);
+  //   Type = GetBaseType(Type);
+  //   if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
+  //       T->isEnumeralType() || T->isConstantArrayType() ||
+  //       T->isDependentSizedArrayType() || T->isVectorType())
+  //     return false;
+
+  //   // Cannot get declarations for dependent types
+  //   if (T->isDependentType()) {
+  //     return Type.getAsString().rfind("std::", 0) ==
+  //       0;
+  //   }
+
+  //   const Decl* TypeDecl = getTypeDecl(Type);
+  //   return inSubstitutedHeader(GetContainingFile(TypeDecl));
+  // }
+
   bool isTemplatedDeclaration(const RecordDecl *RD) const {
     if (RD->isTemplated())
       return true;
@@ -460,6 +483,9 @@ private:
     if (const clang::UsingType *UT = dyn_cast<UsingType>(T))
       T = UT->getUnderlyingType().getTypePtr();
 
+    // if (const clang::TypedefType *TT = dyn_cast<clang::TypedefType>(T))
+    //   T = TT->getUnqualifiedDesugaredType();
+
     if (const SubstTemplateTypeParmType *STTPT =
             dyn_cast<clang::SubstTemplateTypeParmType>(T)) {
       clang::QualType replacedType = STTPT->getReplacementType();
@@ -503,9 +529,8 @@ private:
     std::string CurrentTypename = BaseType.getAsString();
 
     // This handles simple typedefs to built in types
-    if (QT->isBuiltinType() && QT->getTypeClassName() == "Elaborated") {
+    if (QT->isBuiltinType() && QT->getTypeClassName() == "Elaborated")
       return QT.getDesugaredType(Context).getAsString();
-    }
 
     // This is the return type of the view access operator
     if ((CurrentTypename.rfind("std::enable_if_t", 0) == 0) &&
@@ -528,8 +553,10 @@ private:
 
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
           T->isEnumeralType() || T->isConstantArrayType() ||
-          T->isDependentSizedArrayType() || T->isVectorType())
+          T->isDependentSizedArrayType() || T->isVectorType()) {
+        // return CurrentQT.getDesugaredType(Context).getAsString();
         return QT.getAsString();
+      }
 
       if (T->isRecordType()) {
         auto [Scopes, ScopesOnly] =
@@ -692,6 +719,9 @@ private:
     std::string QualifiedType =
         QT.getDesugaredType(Context).getCanonicalType().getAsString();
 
+    // if (QualifiedType.find("type-parameter-0") != std::string::npos)
+    //     QualifiedType = QT.getAsString();
+
     // Constructor return types start with "class " or "struct " due
     // to how we get the QualifiedType we want to return
     std::string ClassSubstr = "class ";
@@ -826,11 +856,10 @@ private:
     return Signature + "{\n" + WrapperBody + "}\n";
   }
 
-  void
-  AddImplicitDefaultConstructorWrapper(const CXXRecordDecl *RD,
-                                       const std::string &ClassName,
-                                       const std::string &FullyScopedClassName,
-                                       std::vector<TypeScope> &&Scopes) {
+  void AddImplicitDefaultConstructorWrapper(
+      const CXXRecordDecl *RD, const std::string &ClassName,
+      const std::string &FullyScopedClassName, std::vector<TypeScope> &&Scopes,
+      int64_t ID) {
     std::string WrapperName = "Wrapper_" + ClassName;
 
     const clang::Type *T = RD->getTypeForDecl();
@@ -869,7 +898,7 @@ private:
         WrapperInfo::Constructor, std::move(FunctionParameters),
         std::move(TemplateArguments));
 
-    WrapperFunctionDefinitions[RD->getID()].insert(WrapperFunctionDefinition);
+    WrapperFunctionDefinitions[ID].insert(WrapperFunctionDefinition);
 
     FunctionWrappers.try_emplace(
         FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
@@ -878,8 +907,7 @@ private:
 
     // We are adding the RD ID instead of a function ID because the function
     // does not exist
-    FunctionForwardDeclarations[RD->getID()].push_back(
-        WrapperFunctionSignature + ";\n");
+    FunctionForwardDeclarations[ID].push_back(WrapperFunctionSignature + ";\n");
 
     auto [FI, NewlyInserted] = Functions.try_emplace(
         FullyScopedName, RD->getNameAsString(), GetContainingFile(RD),
@@ -1160,11 +1188,16 @@ private:
     for (const auto &Param : FD->parameters()) {
       std::string ParamType =
           GetParameterType(Param->getType(), FD->getASTContext());
+
+      if (ParamType == "_Bool")
+        ParamType = "bool";
       std::string ArgumentDereference = "";
-      if ((ForWrapper && Param->getType()->isRecordType()) ||
-          (ForWrapper && Param->getType()->isReferenceType()) ||
-          (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
-                             ParametersThatCanBeRecordTypes.end())) {
+      // if (inSubstitutedHeader(Param->getType()) && ((ForWrapper &&
+      // Param->getType()->isRecordType()) ||
+      if (((ForWrapper && Param->getType()->isRecordType()) ||
+           (ForWrapper && Param->getType()->isReferenceType()) ||
+           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
+                              ParametersThatCanBeRecordTypes.end()))) {
         if (Param->getType()->isReferenceType())
           std::replace(ParamType.begin(), ParamType.end(), '&', ' ');
 
@@ -1204,6 +1237,8 @@ private:
                                    const std::string &ClassName) const {
     std::string ReturnType =
         GetParameterType(FD->getReturnType(), FD->getASTContext());
+    if (ReturnType == "_Bool")
+      ReturnType = "bool";
     std::string Name = FD->getNameAsString();
     auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, ClassName, false);
@@ -1218,26 +1253,36 @@ private:
 
     // Check if this is a templated method in a templated class and
     // add the class's template parameters
-    if (AddClassTemplateParams) {
-      if (const FunctionTemplateDecl *FTD =
-              dyn_cast<FunctionTemplateDecl>(TD)) {
-        const DeclContext *DC = FTD->getDeclContext();
+    // if (AddClassTemplateParams) {
+    //   if (const FunctionTemplateDecl *FTD =
+    //           dyn_cast<FunctionTemplateDecl>(TD)) {
+    //     const DeclContext *DC = FTD->getDeclContext();
 
-        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-          const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+    //     if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+    //       const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
-          if (CTD) {
-            std::string TypenameType;
-            if (AsParameters)
-              TypenameType = "typename ";
-            else
-              TypenameType = "";
+    //       if (CTD) {
+    //         std::string TypenameType;
+    //         if (AsParameters)
+    //           TypenameType = "typename ";
+    //         else
+    //           TypenameType = "";
 
-            TemplateTypenames +=
-                TypenameType + YallaObjectTemplateTypename + ", ";
-          }
-        }
-      }
+    //         TemplateTypenames +=
+    //             TypenameType + YallaObjectTemplateTypename + ", ";
+    //       }
+    //     }
+    //   }
+    // }
+
+    if (TD->isCXXClassMember()) {
+      std::string TypenameType;
+      if (AsParameters)
+        TypenameType = "typename ";
+      else
+        TypenameType = "";
+
+      TemplateTypenames += TypenameType + YallaObjectTemplateTypename + ", ";
     }
 
     for (const NamedDecl *ND : *(TD->getTemplateParameters())) {
@@ -1302,6 +1347,9 @@ private:
     } else {
       ReturnType = GetParameterType(FD->getReturnType(), FTD->getASTContext());
     }
+
+    if (ReturnType == "_Bool")
+      ReturnType = "bool";
 
     std::string Name = FD->getNameAsString();
     auto [Parameters, FunctionParameters, FunctionParameterTypes] =
@@ -1436,7 +1484,7 @@ private:
     auto [ScopesTemp, FullyScopedNameTemp] = GetScopes(CTD);
     if (!DefaultConstructorIsDefined)
       AddImplicitDefaultConstructorWrapper(RD, Name, FullyScopedName,
-                                           std::move(Scopes));
+                                           std::move(Scopes), ID);
   }
 
   void AddEnumInfo(const EnumDecl *ED, const std::string &FileName) {
@@ -1775,14 +1823,19 @@ private:
         const clang::CXXConstructorDecl *CD = CE->getConstructor();
         const clang::CXXRecordDecl *RD = CD->getParent();
 
-        if (const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate())
+        if (const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate()) {
+
+          AddReturnTypeToUsages(CTD);
           TypenameSuffix = GetTemplateTypenames(CTD, false);
-        else if (const ClassTemplateSpecializationDecl *CTSD =
-                     dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
-          TypenameSuffix =
-              GetTemplateTypenames(CTSD->getSpecializedTemplate(), false);
+        } else if (const ClassTemplateSpecializationDecl *CTSD =
+                       dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+          const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate();
+          AddReturnTypeToUsages(CTD);
+          TypenameSuffix = GetTemplateTypenames(CTD, false);
           auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
           TemplateArgs = ClassTemplateArgs;
+        } else {
+          AddReturnTypeToUsages(RD);
         }
 
         // IgnoreUnlessSpelledInSource() is needed for
@@ -2181,29 +2234,47 @@ private:
   void AddReturnTypeToUsages(QualType ReturnType) {
     if (ReturnType->isRecordType() || ReturnType->isEnumeralType()) {
       const Decl *ReturnTypeDecl = getTypeDecl(ReturnType);
+      AddReturnTypeToUsages(ReturnTypeDecl);
+    }
+  }
 
-      const Decl *TypeDecl = getTypeDecl(ReturnType);
-      if (isFromStandardLibrary(TypeDecl) ||
-          isDefinedInMainSourceFile(TypeDecl))
-        return;
+  void AddReturnTypeToUsages(const Decl *ReturnTypeDecl) {
 
-      if (const RecordDecl *RD = dyn_cast<RecordDecl>(ReturnTypeDecl)) {
-        int64_t ID = getRDDefinitionID(RD);
+    if (isFromStandardLibrary(ReturnTypeDecl) ||
+        isDefinedInMainSourceFile(ReturnTypeDecl))
+      return;
 
-        if (DeclarationsSeen.count(ID) == 0)
-          llvm::report_fatal_error("Class usage for Record return type appears "
-                                   "before definition (ID not found)");
+    if (const RecordDecl *RD = dyn_cast<RecordDecl>(ReturnTypeDecl)) {
+      int64_t ID = getRDDefinitionID(RD);
 
-        DeclarationsUsed.insert(ID);
-      } else if (const EnumDecl *ED = dyn_cast<EnumDecl>(ReturnTypeDecl)) {
-        int64_t ID = getEDDefinitionID(ED);
+      if (DeclarationsSeen.count(ID) == 0)
+        llvm::report_fatal_error("Class usage for Record return type appears "
+                                 "before definition (ID not found)");
 
-        if (DeclarationsSeen.count(ID) == 0)
-          llvm::report_fatal_error("Class usage for Enum return type appears "
-                                   "before definition (ID not found)");
+      DeclarationsUsed.insert(ID);
+    } else if (const EnumDecl *ED = dyn_cast<EnumDecl>(ReturnTypeDecl)) {
+      int64_t ID = getEDDefinitionID(ED);
 
-        DeclarationsUsed.insert(ID);
-      }
+      if (DeclarationsSeen.count(ID) == 0)
+        llvm::report_fatal_error("Class usage for Enum return type appears "
+                                 "before definition (ID not found)");
+
+      DeclarationsUsed.insert(ID);
+    } else if (const ClassTemplateDecl *CTD =
+                   dyn_cast<ClassTemplateDecl>(ReturnTypeDecl)) {
+      int64_t ID;
+      const RecordDecl *Definition = CTD->getTemplatedDecl()->getDefinition();
+      if (Definition)
+        ID = Definition->getID();
+      else
+        ID = CTD->getTemplatedDecl()->getID();
+
+      if (DeclarationsSeen.count(ID) == 0)
+        llvm::report_fatal_error(
+            "Class usage for Class template return type appears "
+            "before definition (ID not found)");
+
+      DeclarationsUsed.insert(ID);
     }
   }
 
@@ -2239,6 +2310,10 @@ private:
 
     QualType ReturnType = FD->getReturnType();
     AddReturnTypeToUsages(ReturnType);
+    for (const auto &Param : FD->parameters()) {
+      QualType QT = GetBaseType(Param->getType()).getUnqualifiedType();
+      AddReturnTypeToUsages(QT);
+    }
 
     if (FunctionNeedsWrapper(FD)) {
       auto WrapperIt = FunctionWrappers.find(FullyScopedName);
@@ -2491,12 +2566,25 @@ private:
 
   // Gets the type without & and *
   QualType GetBaseType(QualType Type) const {
-    while (Type->isReferenceType() || Type->isPointerType()) {
+    while (Type->isReferenceType() || Type->isPointerType() ||
+           Type->isLValueReferenceType()) {
       Type = Type->getPointeeType();
     }
 
     return Type;
   }
+
+  // // Gets the type without & and *
+  // const clang::Type* GetBaseTypePtr(QualType Type) const {
+  //   const clang::Type* T = Type.getTypePtr();
+  //   while (Type->isReferenceType() || Type->isPointerType() ||
+  //   Type->isLValueReferenceType()) {
+  //     Type = Type->getPointeeType();
+  //     T = Type.getTypePtr();
+  //   }
+
+  //   return T;
+  // }
 
   std::pair<std::vector<TypeScope>, std::string>
   GetScopes(QualType Type) const {
@@ -2712,7 +2800,7 @@ int main(int argc, const char **argv) {
   Rewriter Rewrite(Sources, LangOptions());
   Tool.applyAllReplacements(Rewrite);
 
-  Rewrite.overwriteChangedFiles();
+  // Rewrite.overwriteChangedFiles();
 
   // ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(),
   // YM.GetFunctions());
