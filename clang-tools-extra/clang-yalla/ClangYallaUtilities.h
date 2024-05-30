@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "clang/Rewrite/Core/Rewriter.h"
+
 struct TypeScope {
   enum class ScopeType {
     ClassScope,
@@ -141,5 +143,95 @@ struct EnumInfo {
         Size(std::move(Size)), Scopes(std::move(Scopes)),
         EnumeratorValuePairs(std::move(EnumeratorValuePairs)) {}
 };
+
+void StoreInNewFiles(clang::Rewriter &Rewrite,
+                     const std::unordered_set<std::string> &SourcePathList,
+                     const std::unordered_set<std::string> &InputHeaders) {
+  // Create temporaries
+  std::vector<std::string> Temporaries;
+  for (const std::string &Filename : SourcePathList) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string TemporaryFilename =
+        ParentPath + p.filename().string() + ".yalla_temp";
+    std::filesystem::copy_file(
+        p, TemporaryFilename,
+        std::filesystem::copy_options::overwrite_existing);
+    Temporaries.push_back(TemporaryFilename);
+  }
+
+  for (const std::string &Filename : InputHeaders) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string TemporaryFilename =
+        ParentPath + p.filename().string() + ".yalla_temp";
+    std::filesystem::copy_file(
+        p, TemporaryFilename,
+        std::filesystem::copy_options::overwrite_existing);
+    Temporaries.push_back(TemporaryFilename);
+  }
+
+  Rewrite.overwriteChangedFiles();
+
+  // Move overwritten files to files with .yalla.
+  for (const std::string &Filename : SourcePathList) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string NewFilename =
+        ParentPath + p.stem().string() + ".yalla" + p.extension().string();
+    std::filesystem::copy_file(
+        p, NewFilename, std::filesystem::copy_options::overwrite_existing);
+  }
+
+  for (const std::string &Filename : InputHeaders) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string NewFilename =
+        ParentPath + p.stem().string() + ".yalla" + p.extension().string();
+    std::filesystem::copy_file(
+        p, NewFilename, std::filesystem::copy_options::overwrite_existing);
+  }
+
+  // Return original contents to input files and delete temporaries
+  for (const std::string &Filename : SourcePathList) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string TemporaryFilename =
+        ParentPath + p.filename().string() + ".yalla_temp";
+    std::filesystem::copy_file(
+        TemporaryFilename, p,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::remove(TemporaryFilename);
+  }
+
+  for (const std::string &Filename : InputHeaders) {
+    std::filesystem::path p(Filename);
+    std::string ParentPath = p.parent_path().string();
+    if (!ParentPath.empty())
+      ParentPath += "/";
+
+    std::string TemporaryFilename =
+        ParentPath + p.filename().string() + ".yalla_temp";
+    std::filesystem::copy_file(
+        TemporaryFilename, p,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::remove(TemporaryFilename);
+  }
+}
 
 #endif

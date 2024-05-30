@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -46,6 +47,11 @@ static llvm::cl::list<std::string> InputHeadersCLI(
         "The headers that are part of the source (not to be substituted)"),
     llvm::cl::ZeroOrMore, llvm::cl::value_desc("PATH_TO_INPUT_HEADER"),
     llvm::cl::CommaSeparated, llvm::cl::Optional);
+
+static llvm::cl::opt<bool>
+    OverwriteCLI("overwrite",
+                 llvm::cl::desc("Overwrite input sources and headers if set"),
+                 llvm::cl::init(false));
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -119,15 +125,9 @@ public:
       }
     }
 
-    if (AllForwardDeclarations != "") {
-      // Replace[MainFilename].add(
-      //     Replacement(*SM, loc, 0, AllForwardDeclarations));
-      std::ofstream outfile;
-
-      outfile.open("decls.cpp",
-                   std::ios_base::app); // append instead of overwrite
-      outfile << AllForwardDeclarations;
-    }
+    if (AllForwardDeclarations != "")
+      Replace[MainFilename].add(
+          Replacement(*SM, loc, 0, AllForwardDeclarations));
   }
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
@@ -2827,7 +2827,10 @@ int main(int argc, const char **argv) {
   Rewriter Rewrite(Sources, LangOptions());
   Tool.applyAllReplacements(Rewrite);
 
-  // Rewrite.overwriteChangedFiles();
+  if (OverwriteCLI)
+    Rewrite.overwriteChangedFiles();
+  else
+    StoreInNewFiles(Rewrite, SourcePaths, InputHeaders);
 
   // ForwardDeclareClassesAndFunctions(Tool, YM.GetClasses(),
   // YM.GetFunctions());
@@ -2837,7 +2840,8 @@ int main(int argc, const char **argv) {
   auto ActionFactory = newFrontendActionFactory<IncludeFinderAction>();
   IncludeTool.run(ActionFactory.get());
 
-  WriteWrappersFile("wrappers.cpp", IncludedFiles, YM.GetWrapperDefinitions(),
+  WriteWrappersFile("wrappers.yalla.cpp", IncludedFiles,
+                    YM.GetWrapperDefinitions(),
                     YM.GetClassTemplateInstantiations(),
                     YM.GetFunctionTemplateInstantiations());
 
