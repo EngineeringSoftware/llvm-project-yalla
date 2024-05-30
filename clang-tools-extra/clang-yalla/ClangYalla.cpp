@@ -874,6 +874,11 @@ private:
       llvm::report_fatal_error(
           "Do not add default constructor wrappers for non templates");
 
+    // Have to stop this early because otherwise we would not have the
+    // template parameters for the forward declarations
+    if (hasEmptyTemplateParameters(CTD))
+      return;
+
     std::string TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
 
     // The template arguments are going to be used to invoke the
@@ -1824,7 +1829,6 @@ private:
         const clang::CXXRecordDecl *RD = CD->getParent();
 
         if (const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate()) {
-
           AddReturnTypeToUsages(CTD);
           TypenameSuffix = GetTemplateTypenames(CTD, false);
         } else if (const ClassTemplateSpecializationDecl *CTSD =
@@ -2243,6 +2247,19 @@ private:
     if (isFromStandardLibrary(ReturnTypeDecl) ||
         isDefinedInMainSourceFile(ReturnTypeDecl))
       return;
+
+    // A CXXRecordDecl can be templated
+    if (const CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(ReturnTypeDecl)) {
+      if (const ClassTemplateDecl *CTD = CXXRD->getDescribedClassTemplate()) {
+        AddReturnTypeToUsages(CTD);
+        return;
+      } else if (const ClassTemplateSpecializationDecl *CTSD =
+                     dyn_cast<ClassTemplateSpecializationDecl>(CXXRD)) {
+        const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate();
+        AddReturnTypeToUsages(CTD);
+        return;
+      }
+    }
 
     if (const RecordDecl *RD = dyn_cast<RecordDecl>(ReturnTypeDecl)) {
       int64_t ID = getRDDefinitionID(RD);
@@ -2730,6 +2747,16 @@ private:
         llvm::report_fatal_error("T cannot be nullptr at this point");
 
       if (dyn_cast<clang::UnresolvedUsingType>(T))
+        return true;
+    }
+
+    return false;
+  }
+
+  // This is typically true for forward declared classes
+  bool hasEmptyTemplateParameters(const ClassTemplateDecl *CTD) const {
+    for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
+      if (ND->getNameAsString() == "")
         return true;
     }
 
