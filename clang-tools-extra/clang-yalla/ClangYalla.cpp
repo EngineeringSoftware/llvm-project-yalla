@@ -960,6 +960,13 @@ private:
         std::string ToReplace = "operator ";
         OriginalName.replace(OriginalName.find(ToReplace), ToReplace.length(),
                              "CastOperator_");
+
+        // Happening for rapidjson for the bool cast operator. See
+        // line 121 in error.h
+        std::string Troublesome = " (rapidjson::ParseResult::*)() const";
+        if (OriginalName.find(Troublesome) != std::string::npos)
+          OriginalName.replace(OriginalName.find(Troublesome),
+                               Troublesome.length(), "");
       }
 
       WrapperName = "Wrapper_" + OriginalName;
@@ -979,6 +986,10 @@ private:
     if (WrapperReturnType == "_Bool")
       WrapperReturnType = "bool";
 
+    // Currently happening for capitalize.cpp
+    if (WrapperReturnType == "BooleanType")
+      WrapperReturnType = "bool";
+
     auto [Parameters, FunctionParameters, FunctionParameterTypes] =
         GetFunctionParameters(FD, FullyScopedClassName, true);
 
@@ -991,31 +1002,34 @@ private:
       if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
         const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
-        if (CTD) {
+        if (WrapperType == WrapperInfo::Method) {
+          if (CTD) {
+            TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
+
+            // We still want to add the yalla object template type parameter
+            std::string ReplaceWith =
+                "template <typename " + YallaObjectTemplateTypename + ", ";
+            std::string ToReplace = "template <";
+            std::size_t ReplaceLoc = TemplateTypenames.find(ToReplace);
+
+            if (ReplaceLoc == std::string::npos)
+              llvm::report_fatal_error(
+                  "Something went wrong in adding wrapper");
+
+            TemplateTypenames.replace(ReplaceLoc, ToReplace.length(),
+                                      ReplaceWith);
+          } else {
+            TemplateTypenames =
+                "template <typename " + YallaObjectTemplateTypename + ">";
+          }
+        } else if (CTD && WrapperType == WrapperInfo::Constructor) {
           TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
-
-          // We still want to add the yalla object template type parameter
-          std::string ReplaceWith =
-              "template <typename " + YallaObjectTemplateTypename + ", ";
-          std::string ToReplace = "template <";
-          std::size_t ReplaceLoc = TemplateTypenames.find(ToReplace);
-
-          if (ReplaceLoc == std::string::npos)
-            llvm::report_fatal_error("Something went wrong in adding wrapper");
-
-          TemplateTypenames.replace(ReplaceLoc, ToReplace.length(),
-                                    ReplaceWith);
-
           // The template arguments are going to be used to invoke the
           // function being wrapped. The only situation where we would
           // want to specify the template argument in the function
           // call is in the constructor. This is used in the wrapper
           // definition to call the original constructor
-          if (WrapperType == WrapperInfo::Constructor)
-            TemplateArguments = GetTemplateTypenames(CTD, false);
-        } else {
-          TemplateTypenames =
-              "template <typename " + YallaObjectTemplateTypename + ">";
+          TemplateArguments = GetTemplateTypenames(CTD, false);
         }
       }
     }
@@ -1218,6 +1232,18 @@ private:
       if (ArgumentName == "")
         ArgumentName =
             std::string("yalla_placeholder_arg_") + std::to_string(current);
+
+      // This means the parameter has a default value
+      if (Param->hasInit()) {
+        LangOptions LangOpts;
+        PrintingPolicy Policy(LangOpts);
+        Policy.adjustForCPlusPlus();
+
+        const Expr *Default = Param->getInit();
+        std::string DefaultValue;
+        if (getCompileTimeValue(Default, FD->getASTContext(), DefaultValue))
+          ArgumentName += " = " + DefaultValue;
+      }
 
       Parameters += " ";
       Parameters += ArgumentName;
@@ -1759,22 +1785,17 @@ private:
       llvm::report_fatal_error("Found class usage before definition");
 
     std::string NewDeclaration = "";
-    // Copied from below, but this is specifically for parameter and
-    // field declarations. Need to replace the template parameters in
+    // Copied from below, need to replace the template parameters in
     // the return type with the arguments it is being instantiated
     // with
-    if (clang::dyn_cast<clang::ParmVarDecl>(DD) ||
-        clang::dyn_cast<clang::FieldDecl>(DD)) {
-      std::string ClassTemplateArgs = "";
-      if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
-        if (const auto *RT = TST->getAs<RecordType>()) {
-          if (const auto *CTSD =
-                  dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
-            // Still need to add scoping stuff
-            auto ArgsMapPair = GetTemplateArgs(CTSD);
-            ClassTemplateArgs = std::get<0>(ArgsMapPair);
-            NewDeclaration = FullyScopedName + ClassTemplateArgs + "* ";
-          }
+    if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
+      if (const auto *RT = TST->getAs<RecordType>()) {
+        if (const auto *CTSD =
+                dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
+          // Still need to add scoping stuff
+          auto ArgsMapPair = GetTemplateArgs(CTSD);
+          std::string ClassTemplateArgs = std::get<0>(ArgsMapPair);
+          NewDeclaration = FullyScopedName + ClassTemplateArgs + "* ";
         }
       }
     }
@@ -2186,6 +2207,15 @@ private:
     llvm::raw_string_ostream TypesOS(ArgTypesStr);
 
     for (const Expr *Arg : CE->arguments()) {
+      std::string CurrentArg;
+      llvm::raw_string_ostream CurrentArgOS(CurrentArg);
+      Arg->printPretty(CurrentArgOS, nullptr, Policy, 0);
+
+      // This means that we have started with the default arguments
+      // and we can break
+      if (CurrentArg == "")
+        break;
+
       if (Arg != CE->getArg(0)) {
         CallOS << ", ";
         TypesOS << ", ";
@@ -2758,6 +2788,20 @@ private:
     for (const NamedDecl *ND : *(CTD->getTemplateParameters())) {
       if (ND->getNameAsString() == "")
         return true;
+    }
+
+    return false;
+  }
+
+  // Check if the expression can be evaluated as a constant.
+  bool getCompileTimeValue(const Expr *E, ASTContext &Context,
+                           std::string &Value) const {
+    if (E->isEvaluatable(Context)) {
+      clang::Expr::EvalResult result;
+      if (E->EvaluateAsRValue(result, Context)) {
+        Value = result.Val.getAsString(Context, E->getType());
+        return true;
+      }
     }
 
     return false;
