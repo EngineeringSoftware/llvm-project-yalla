@@ -416,7 +416,7 @@ private:
   std::unordered_set<int64_t> DeclarationsSeen;
   std::unordered_map<int64_t, std::vector<std::string>>
       ClassForwardDeclarations;
-  std::unordered_map<int64_t, std::vector<std::string>>
+  std::unordered_map<int64_t, std::unordered_set<std::string>>
       FunctionForwardDeclarations;
   std::unordered_map<int64_t, std::unordered_set<std::string>>
       WrapperFunctionDefinitions;
@@ -803,8 +803,11 @@ private:
       return true;
 
     for (const ParmVarDecl *PVD : FD->parameters()) {
-      if (PVD->getType()->isRecordType())
-        return true;
+      if (PVD->getType()->isRecordType()) {
+        const Decl *TypeDecl =
+            getTypeDecl(GetBaseType(PVD->getType().getUnqualifiedType()));
+        return !isDefinedInMainSourceFile(TypeDecl);
+      }
     }
 
     return false;
@@ -962,7 +965,7 @@ private:
 
     // We are adding the RD ID instead of a function ID because the function
     // does not exist
-    FunctionForwardDeclarations[ID].push_back(WrapperFunctionSignature + ";\n");
+    FunctionForwardDeclarations[ID].insert(WrapperFunctionSignature + ";\n");
 
     auto [FI, NewlyInserted] = Functions.try_emplace(
         FullyScopedName, RD->getNameAsString(), GetContainingFile(RD),
@@ -1040,66 +1043,101 @@ private:
     if (WrapperReturnType == "BooleanType")
       WrapperReturnType = "bool";
 
-    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
-        GetFunctionParameters(FD, FullyScopedClassName, true);
+    // Normal Function Decls would only enter the loop once, this is
+    // for Function Decls that are methods in a templated class
+    for (const FunctionDecl *SpecFD : GetFunctionTemplateSpecializations(FD)) {
+      auto [Parameters, FunctionParameters, FunctionParameterTypes] =
+          GetFunctionParameters(SpecFD, FullyScopedClassName, true, FD);
 
-    std::string TemplateTypenames = "";
-    std::string TemplateArguments = "";
+      std::string TemplateTypenames = "";
+      std::string TemplateArguments = "";
 
-    if (FD->isCXXClassMember()) {
-      const DeclContext *DC = FD->getDeclContext();
+      if (FD->isCXXClassMember()) {
+        const DeclContext *DC = FD->getDeclContext();
 
-      if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-        const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+          const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
 
-        if (WrapperType == WrapperInfo::Method) {
-          if (CTD) {
+          if (WrapperType == WrapperInfo::Method) {
+            if (CTD) {
+              TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
+
+              // We still want to add the yalla object template type parameter
+              std::string ReplaceWith =
+                  "template <typename " + YallaObjectTemplateTypename + ", ";
+              std::string ToReplace = "template <";
+              std::size_t ReplaceLoc = TemplateTypenames.find(ToReplace);
+
+              if (ReplaceLoc == std::string::npos)
+                llvm::report_fatal_error(
+                    "Something went wrong in adding wrapper");
+
+              TemplateTypenames.replace(ReplaceLoc, ToReplace.length(),
+                                        ReplaceWith);
+            } else {
+              TemplateTypenames =
+                  "template <typename " + YallaObjectTemplateTypename + ">";
+            }
+          } else if (CTD && WrapperType == WrapperInfo::Constructor) {
             TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
-
-            // We still want to add the yalla object template type parameter
-            std::string ReplaceWith =
-                "template <typename " + YallaObjectTemplateTypename + ", ";
-            std::string ToReplace = "template <";
-            std::size_t ReplaceLoc = TemplateTypenames.find(ToReplace);
-
-            if (ReplaceLoc == std::string::npos)
-              llvm::report_fatal_error(
-                  "Something went wrong in adding wrapper");
-
-            TemplateTypenames.replace(ReplaceLoc, ToReplace.length(),
-                                      ReplaceWith);
-          } else {
-            TemplateTypenames =
-                "template <typename " + YallaObjectTemplateTypename + ">";
+            // The template arguments are going to be used to invoke the
+            // function being wrapped. The only situation where we would
+            // want to specify the template argument in the function
+            // call is in the constructor. This is used in the wrapper
+            // definition to call the original constructor
+            TemplateArguments = GetTemplateTypenames(CTD, false);
           }
-        } else if (CTD && WrapperType == WrapperInfo::Constructor) {
-          TemplateTypenames = GetTemplateTypenames(CTD) + "\n";
-          // The template arguments are going to be used to invoke the
-          // function being wrapped. The only situation where we would
-          // want to specify the template argument in the function
-          // call is in the constructor. This is used in the wrapper
-          // definition to call the original constructor
-          TemplateArguments = GetTemplateTypenames(CTD, false);
         }
       }
+
+      std::string WrapperFunctionSignature = TemplateTypenames +
+                                             WrapperReturnType + " " +
+                                             WrapperName + Parameters;
+      std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
+          WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
+          FD->getNameAsString(), FullyScopedName, FullyScopedClassName,
+          WrapperType, std::move(FunctionParameters),
+          std::move(TemplateArguments));
+
+      WrapperFunctionDefinitions[FD->getID()].insert(WrapperFunctionDefinition);
+      FunctionForwardDeclarations[FD->getID()].insert(WrapperFunctionSignature +
+                                                      ";\n");
+
+      FunctionWrappers.try_emplace(FullyScopedName, WrapperName,
+                                   WrapperReturnType, std::move(Parameters),
+                                   std::move(WrapperFunctionDefinition),
+                                   std::move(FunctionParameterTypes));
+    }
+  }
+
+  std::vector<bool>
+  GetWrapperParametersThatShouldBePointers(const FunctionDecl *FD) const {
+    // A FunctionTemplateDecl that is called by the user will have
+    // different specializations. This function goes over each
+    // specialization and generates a vector of booleans, with one
+    // boolean per parameter. The boolean is true if for the given
+    // specialization the argument passed requires that the parameter
+    // be made into a pointer and false if it should be left alone.
+
+    std::vector<bool> CurrentConfiguration;
+    for (const ParmVarDecl *PVD : FD->parameters()) {
+      QualType BaseType = GetBaseType(PVD->getType().getUnqualifiedType());
+      const clang::Type *T =
+          BaseType.getDesugaredType(PVD->getASTContext()).getTypePtr();
+
+      bool MakeIntoPointer = false;
+      if (T->isRecordType() && !PVD->getType()->isPointerType()) {
+        const Decl *TypeDecl = getTypeDecl(BaseType);
+
+        std::string Filename = GetContainingFile(TypeDecl);
+        if (inSubstitutedHeader(Filename))
+          MakeIntoPointer = true;
+      }
+
+      CurrentConfiguration.push_back(MakeIntoPointer);
     }
 
-    std::string WrapperFunctionSignature =
-        TemplateTypenames + WrapperReturnType + " " + WrapperName + Parameters;
-    std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
-        WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
-        FD->getNameAsString(), FullyScopedName, FullyScopedClassName,
-        WrapperType, std::move(FunctionParameters),
-        std::move(TemplateArguments));
-
-    WrapperFunctionDefinitions[FD->getID()].insert(WrapperFunctionDefinition);
-    FunctionForwardDeclarations[FD->getID()].push_back(
-        WrapperFunctionSignature + ";\n");
-
-    FunctionWrappers.try_emplace(
-        FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
-        std::move(Parameters), std::move(WrapperFunctionDefinition),
-        std::move(FunctionParameterTypes));
+    return CurrentConfiguration;
   }
 
   void AddFunctionWrapper(const FunctionTemplateDecl *FTD,
@@ -1150,57 +1188,47 @@ private:
       AddClassTemplateParams = false;
     }
 
-    std::unordered_set<int> ParametersThatCanBeRecordTypes;
-    for (const FunctionDecl *FD : FTD->specializations()) {
-      int current = 0;
-      for (const ParmVarDecl *PVD : FD->parameters()) {
-        if (PVD->getType()->isRecordType()) {
-          ParametersThatCanBeRecordTypes.insert(current);
+    for (const FunctionDecl *SpecFD : GetFunctionTemplateSpecializations(FTD)) {
+      auto [Parameters, FunctionParameters, FunctionParameterTypes] =
+          GetFunctionParameters(SpecFD, ClassName, true, FD);
+
+      std::string TemplateArguments;
+      if (WrapperType == WrapperInfo::Constructor) {
+        const DeclContext *DC = FD->getDeclContext();
+
+        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+          const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+
+          if (CTD) {
+            // The template arguments are going to be used to invoke the
+            // constructor, so we use the ClassTemplateDecl
+            TemplateArguments = GetTemplateTypenames(CTD, false);
+          }
         }
-        current++;
+      } else {
+        TemplateArguments =
+            GetTemplateTypenames(FTD, false, AddClassTemplateParams);
       }
+
+      std::string WrapperFunctionSignature = TemplateTypenames + "\n" +
+                                             WrapperReturnType + " " +
+                                             WrapperName + Parameters;
+      std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
+          WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
+          FD->getNameAsString(), FullyScopedName, ClassName, WrapperType,
+          std::move(FunctionParameters), std::move(TemplateArguments));
+
+      WrapperFunctionDefinitions[FTD->getTemplatedDecl()->getID()].insert(
+          WrapperFunctionDefinition);
+
+      FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].insert(
+          WrapperFunctionSignature + ";\n");
+
+      FunctionWrappers.try_emplace(FullyScopedName, WrapperName,
+                                   WrapperReturnType, std::move(Parameters),
+                                   std::move(WrapperFunctionDefinition),
+                                   std::move(FunctionParameterTypes));
     }
-
-    auto [Parameters, FunctionParameters, FunctionParameterTypes] =
-        GetFunctionParameters(FD, ClassName, true,
-                              ParametersThatCanBeRecordTypes);
-
-    std::string TemplateArguments;
-    if (WrapperType == WrapperInfo::Constructor) {
-      const DeclContext *DC = FD->getDeclContext();
-
-      if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-        const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
-
-        if (CTD) {
-          // The template arguments are going to be used to invoke the
-          // constructor, so we use the ClassTemplateDecl
-          TemplateArguments = GetTemplateTypenames(CTD, false);
-        }
-      }
-    } else {
-      TemplateArguments =
-          GetTemplateTypenames(FTD, false, AddClassTemplateParams);
-    }
-
-    std::string WrapperFunctionSignature = TemplateTypenames + "\n" +
-                                           WrapperReturnType + " " +
-                                           WrapperName + Parameters;
-    std::string WrapperFunctionDefinition = GenerateWrapperDefinition(
-        WrapperFunctionSignature, WrapperReturnType, ReturnsClassByValue,
-        FD->getNameAsString(), FullyScopedName, ClassName, WrapperType,
-        std::move(FunctionParameters), std::move(TemplateArguments));
-
-    WrapperFunctionDefinitions[FTD->getTemplatedDecl()->getID()].insert(
-        WrapperFunctionDefinition);
-
-    FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].push_back(
-        WrapperFunctionSignature + ";\n");
-
-    FunctionWrappers.try_emplace(
-        FullyScopedName, std::move(WrapperName), std::move(WrapperReturnType),
-        std::move(Parameters), std::move(WrapperFunctionDefinition),
-        std::move(FunctionParameterTypes));
   }
 
   std::string GetClassDeclaration(const RecordDecl *RD,
@@ -1239,8 +1267,12 @@ private:
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
   GetFunctionParameters(const FunctionDecl *FD, const std::string &ClassName,
                         bool ForWrapper,
-                        const std::unordered_set<int>
-                            &ParametersThatCanBeRecordTypes = {}) const {
+                        const FunctionDecl *OriginalFD = nullptr) const {
+    std::vector<bool> ParametersThatShouldBePointers;
+    if (ForWrapper)
+      ParametersThatShouldBePointers =
+          GetWrapperParametersThatShouldBePointers(FD);
+
     std::string Parameters = "";
     std::vector<std::string> FunctionArgumentTypes;
     std::vector<std::string> FunctionArguments;
@@ -1253,30 +1285,35 @@ private:
       FunctionArgumentTypes.emplace_back(ClassName);
     }
 
+    // Don't use the specialized FD since it messes up the typenames
+    const FunctionDecl *FDParams = OriginalFD ? OriginalFD : FD;
+
     int current = 0;
-    for (const auto &Param : FD->parameters()) {
-      std::string ParamType =
-          GetParameterType(Param->getType(), FD->getASTContext());
+    for (const auto &Param : FDParams->parameters()) {
+      // If we are doing a specialization and the original has more
+      // params we should stop. This is the case for when the original
+      // has packed args/template args and the specialization has 0.
+      if (OriginalFD && current >= FD->getNumParams())
+        break;
 
-      if (ParamType == "_Bool")
-        ParamType = "bool";
+      std::string ParamType;
       std::string ArgumentDereference = "";
-      // if (inSubstitutedHeader(Param->getType()) && ((ForWrapper &&
-      // Param->getType()->isRecordType()) ||
-      if (((ForWrapper && Param->getType()->isRecordType()) ||
-           (ForWrapper && Param->getType()->isReferenceType()) ||
-           (ForWrapper && ParametersThatCanBeRecordTypes.find(current) !=
-                              ParametersThatCanBeRecordTypes.end()))) {
-        if (Param->getType()->isReferenceType())
-          std::replace(ParamType.begin(), ParamType.end(), '&', ' ');
 
+      if (ForWrapper && ParametersThatShouldBePointers[current]) {
+        ParamType = GetParameterType(GetBaseType(Param->getType()),
+                                     FD->getASTContext());
         ParamType += "*";
         ArgumentDereference = "*"; // Need to dereference the parameter that we
                                    // are making into a pointer
+      } else {
+        // Keep the original qualifiers in this case
+        ParamType = GetParameterType(Param->getType(), FD->getASTContext());
       }
 
-      Parameters += ParamType;
+      if (ParamType == "_Bool")
+        ParamType = "bool";
 
+      Parameters += ParamType;
       std::string ArgumentName = Param->getNameAsString();
       // Handle arguments with no name
       if (ArgumentName == "")
@@ -2123,7 +2160,7 @@ private:
     // If it needs a wrapper, AddFunctionWrapper will add it to the
     // forward declarations
     if (!NeedsWrapper)
-      FunctionForwardDeclarations[FD->getID()].push_back(
+      FunctionForwardDeclarations[FD->getID()].insert(
           std::move(ForwardDeclaration));
 
     MainFilename = FileName;
@@ -2184,7 +2221,7 @@ private:
     // function even if it needs a wrapper. Methods cannot be
     // forward declared so we do not forward declare them.
     if (!FTD->getTemplatedDecl()->isCXXClassMember())
-      FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].push_back(
+      FunctionForwardDeclarations[FTD->getTemplatedDecl()->getID()].insert(
           std::move(ForwardDeclaration));
 
     MainFilename = FileName;
@@ -2587,8 +2624,8 @@ private:
     WrapperFunctionDefinitions[ED->getID()].insert(WrapperFunctionDefinition);
     std::vector<std::string> Parameters;
 
-    FunctionForwardDeclarations[ED->getID()].push_back(
-        WrapperFunctionSignature + ";\n");
+    FunctionForwardDeclarations[ED->getID()].insert(WrapperFunctionSignature +
+                                                    ";\n");
 
     FunctionWrappers.try_emplace(
         std::move(EnumConstantScopedName), std::move(WrapperName),
@@ -2893,6 +2930,104 @@ private:
     }
 
     return false;
+  }
+
+  bool areSameInSource(const Decl *D1, const Decl *D2) const {
+    SourceLocation Loc1 = D1->getLocation();
+    SourceLocation Loc2 = D2->getLocation();
+
+    const SourceManager &SM = D1->getASTContext().getSourceManager();
+    // Optionally get the expansion locations if macros are involved
+    Loc1 = SM.getExpansionLoc(Loc1);
+    Loc2 = SM.getExpansionLoc(Loc2);
+
+    FileID File1 = SM.getFileID(Loc1);
+    FileID File2 = SM.getFileID(Loc2);
+
+    return File1 == File2 &&
+           SM.getSpellingLineNumber(Loc1) == SM.getSpellingLineNumber(Loc2);
+  }
+
+  std::unordered_set<const FunctionDecl *>
+  GetFunctionTemplateSpecializations(const FunctionDecl *FD) const {
+    // For function decls that are not templated, we get the CTD they
+    // are part of (if they are part of one)
+    std::unordered_set<const FunctionDecl *> Specializations;
+
+    const DeclContext *DC = FD->getDeclContext();
+    const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC);
+    const ClassTemplateDecl *CTD =
+        RD ? RD->getDescribedClassTemplate() : nullptr;
+
+    // Getting the specializations of a templated method in a
+    // templated class requires getting the specializations of the
+    // class first.
+    if (FD->isCXXClassMember() && CTD) {
+      const DeclContext *DC = FD->getDeclContext();
+
+      for (const ClassTemplateSpecializationDecl *CTSD :
+           CTD->specializations()) {
+        for (const Decl *D : CTSD->decls()) {
+          const FunctionDecl *MethodFD = dyn_cast<FunctionDecl>(D);
+
+          if (!MethodFD)
+            continue;
+
+          // I need to check if this is the original method whose
+          // specializations I was getting
+          if (!areSameInSource(MethodFD, FD))
+            continue;
+
+          Specializations.insert(MethodFD);
+        }
+      }
+    } else {
+      Specializations.insert(FD);
+    }
+
+    return Specializations;
+  }
+
+  std::unordered_set<const FunctionDecl *>
+  GetFunctionTemplateSpecializations(const FunctionTemplateDecl *FTD) const {
+    std::unordered_set<const FunctionDecl *> Specializations;
+
+    const DeclContext *DC = FTD->getDeclContext();
+    const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC);
+    const ClassTemplateDecl *CTD =
+        RD ? RD->getDescribedClassTemplate() : nullptr;
+
+    // Getting the specializations of a templated method in a
+    // templated class requires getting the specializations of the
+    // class first.
+    if (FTD->isCXXClassMember() && CTD) {
+      const DeclContext *DC = FTD->getDeclContext();
+
+      for (const ClassTemplateSpecializationDecl *CTSD :
+           CTD->specializations()) {
+        for (const Decl *D : CTSD->decls()) {
+          const FunctionTemplateDecl *MethodFTD =
+              dyn_cast<FunctionTemplateDecl>(D);
+
+          if (!MethodFTD)
+            continue;
+
+          // I need to check if this is the original method whose
+          // specializations I was getting
+          if (!areSameInSource(MethodFTD, FTD))
+            continue;
+
+          for (const FunctionDecl *Specialization :
+               MethodFTD->specializations())
+            Specializations.insert(Specialization);
+        }
+      }
+    } else {
+      for (const FunctionDecl *FD : FTD->specializations())
+        Specializations.insert(FD);
+    }
+
+    return Specializations;
   }
 };
 

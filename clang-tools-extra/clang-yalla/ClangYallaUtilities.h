@@ -117,7 +117,7 @@ struct WrapperInfo {
 
   enum WrapperType { Destructor, Constructor, Method, Function };
 
-  WrapperInfo(std::string &&WrapperName, std::string &&WrapperReturnType,
+  WrapperInfo(std::string WrapperName, std::string WrapperReturnType,
               std::string &&WrapperParameters, std::string &&WrapperDefinition,
               std::vector<std::string> &&WrapperParameterTypes)
       : WrapperName(std::move(WrapperName)),
