@@ -1369,30 +1369,6 @@ private:
                                    bool AddClassTemplateParams = true) const {
     std::string TemplateTypenames = AsParameters ? "template <" : "<";
 
-    // Check if this is a templated method in a templated class and
-    // add the class's template parameters
-    // if (AddClassTemplateParams) {
-    //   if (const FunctionTemplateDecl *FTD =
-    //           dyn_cast<FunctionTemplateDecl>(TD)) {
-    //     const DeclContext *DC = FTD->getDeclContext();
-
-    //     if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
-    //       const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
-
-    //       if (CTD) {
-    //         std::string TypenameType;
-    //         if (AsParameters)
-    //           TypenameType = "typename ";
-    //         else
-    //           TypenameType = "";
-
-    //         TemplateTypenames +=
-    //             TypenameType + YallaObjectTemplateTypename + ", ";
-    //       }
-    //     }
-    //   }
-    // }
-
     if (TD->isCXXClassMember()) {
       std::string TypenameType;
       if (AsParameters)
@@ -1401,6 +1377,40 @@ private:
         TypenameType = "";
 
       TemplateTypenames += TypenameType + YallaObjectTemplateTypename + ", ";
+    }
+
+    // TODO: undecided yet if I wanna add the class's template
+    // args + params. We do add them in the current state.
+
+    // Check if this is a templated method in a templated class and
+    // add the class's template parameters
+    if (AddClassTemplateParams) {
+      if (const FunctionTemplateDecl *FTD =
+              dyn_cast<FunctionTemplateDecl>(TD)) {
+        const DeclContext *DC = FTD->getDeclContext();
+
+        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(DC)) {
+          const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate();
+
+          if (CTD) {
+            std::string ClassTemplateTypenames =
+                GetTemplateTypenames(CTD, AsParameters, AddClassTemplateParams);
+            std::string ToReplace = AsParameters ? "template <" : "<";
+
+            if (ClassTemplateTypenames.find(ToReplace) == std::string::npos)
+              llvm::report_fatal_error(
+                  "Error while trying to get class template parameters");
+
+            ClassTemplateTypenames.replace(
+                ClassTemplateTypenames.find(ToReplace), ToReplace.length(), "");
+            ClassTemplateTypenames = ClassTemplateTypenames.substr(
+                0, ClassTemplateTypenames.size() -
+                       1); // remove the chevron at the end
+
+            TemplateTypenames += ClassTemplateTypenames + ", ";
+          }
+        }
+      }
     }
 
     for (const NamedDecl *ND : *(TD->getTemplateParameters())) {
@@ -1668,10 +1678,14 @@ private:
           FullyScopedName += "::";
         FullyScopedName += RD->getNameAsString();
         result = FullyScopedName + ClassTemplateArgs;
-        // result = ClassTemplateArgs.substr(1, ClassTemplateArgs.size() - 2) +
-        //          ", "; // remove the < and >
         TemplateParameterToArgument.insert(ClassTemplateParamMap.begin(),
                                            ClassTemplateParamMap.end());
+
+        // TODO: undecided yet if I wanna add the class's template
+        // args + params. We do add them in the current state.
+        std::string SeparatedArgs = ClassTemplateArgs.substr(
+            1, ClassTemplateArgs.size() - 2); // remove the < and >
+        result += ", " + SeparatedArgs;
       }
     }
 
