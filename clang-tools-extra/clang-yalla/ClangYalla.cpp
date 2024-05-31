@@ -552,16 +552,21 @@ private:
       T = CurrentQT.getDesugaredType(Context).getTypePtr();
 
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
-          T->isEnumeralType() || T->isConstantArrayType() ||
-          T->isDependentSizedArrayType() || T->isVectorType()) {
+          T->isConstantArrayType() || T->isDependentSizedArrayType() ||
+          T->isVectorType()) {
         // return CurrentQT.getDesugaredType(Context).getAsString();
         return QT.getAsString();
       }
 
-      if (T->isRecordType()) {
+      if (T->isRecordType() || T->isEnumeralType()) {
         auto [Scopes, ScopesOnly] =
             GetScopes(CurrentQT.getCanonicalType().getUnqualifiedType());
-        OriginalTypeName = T->getAsRecordDecl()->getNameAsString();
+
+        if (T->isRecordType())
+          OriginalTypeName = T->getAsRecordDecl()->getNameAsString();
+        else if (T->isEnumeralType())
+          OriginalTypeName = T->getAsTagDecl()->getNameAsString();
+
         if (!ScopesOnly.empty())
           ScopesOnly += "::";
         FullyScopedName = ScopesOnly + OriginalTypeName;
@@ -711,7 +716,7 @@ private:
     if (isFromStandardLibrary(TypeDecl))
       return QT.getAsString();
 
-    if (!(T->isRecordType() || T->isDependentType()))
+    if (!(T->isRecordType() || T->isDependentType() || T->isEnumeralType()))
       llvm::report_fatal_error(
           "Internal error, T must be a RecordType or DependentType");
 
@@ -726,10 +731,13 @@ private:
     // to how we get the QualifiedType we want to return
     std::string ClassSubstr = "class ";
     std::string StructSubstr = "struct ";
+    std::string EnumSubstr = "enum ";
     if (QualifiedType.compare(0, ClassSubstr.size(), ClassSubstr) == 0)
       QualifiedType = QualifiedType.substr(ClassSubstr.size());
     else if (QualifiedType.compare(0, StructSubstr.size(), StructSubstr) == 0)
       QualifiedType = QualifiedType.substr(StructSubstr.size());
+    else if (QualifiedType.compare(0, EnumSubstr.size(), EnumSubstr) == 0)
+      QualifiedType = QualifiedType.substr(EnumSubstr.size());
 
     // If the type already contains the fully scoped name (plus
     // potentially some qualifiers), return it as is
@@ -1340,6 +1348,10 @@ private:
           ParameterName += "...";
         }
       }
+
+      std::string DefaultValue;
+      if (AsParameters && getDefaultTemplateArgument(ND, DefaultValue))
+        ParameterName += " = " + DefaultValue;
 
       if (AsParameters && TypenameType[TypenameType.size() - 1] != ' ')
         TypenameType += " ";
@@ -2801,6 +2813,25 @@ private:
       if (E->EvaluateAsRValue(result, Context)) {
         Value = result.Val.getAsString(Context, E->getType());
         return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool getDefaultTemplateArgument(const NamedDecl *ND,
+                                  std::string &Value) const {
+    if (const TemplateTypeParmDecl *TTPD = dyn_cast<TemplateTypeParmDecl>(ND)) {
+      if (TTPD->hasDefaultArgument()) {
+        Value =
+            GetParameterType(TTPD->getDefaultArgument(), ND->getASTContext());
+        return true;
+      }
+    } else if (const NonTypeTemplateParmDecl *NTPD =
+                   clang::dyn_cast<NonTypeTemplateParmDecl>(ND)) {
+      if (NTPD->hasDefaultArgument()) {
+        return getCompileTimeValue(NTPD->getDefaultArgument(),
+                                   ND->getASTContext(), Value);
       }
     }
 
