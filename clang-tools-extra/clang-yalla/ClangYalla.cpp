@@ -96,6 +96,8 @@ StatementMatcher FunctionCallMatcher =
           cxxConstructExpr().bind("ConstructorCall"));
 StatementMatcher EnumConstantUsage =
     declRefExpr(to(enumConstantDecl())).bind("EnumConstantUsage");
+StatementMatcher PotentialPointerMatcher =
+    declRefExpr().bind("PotentialPointer");
 
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
@@ -305,6 +307,42 @@ public:
           AddEnumConstantUsage(DRE, ECD, FileName);
       }
     }
+
+    if (const DeclRefExpr *DRE =
+            Result.Nodes.getNodeAs<clang::DeclRefExpr>("PotentialPointer")) {
+      std::string FileName = GetContainingFile(DRE);
+      if (!isDefinedInMainSourceFile(FileName))
+        return;
+
+      LangOptions LangOpts;
+      PrintingPolicy Policy(LangOpts);
+      Policy.adjustForCPlusPlus();
+
+      std::string VariableName;
+      llvm::raw_string_ostream Stream(VariableName);
+
+      DRE->printPretty(Stream, nullptr, Policy);
+      Stream.flush();
+
+      const ValueDecl *VD = DRE->getDecl();
+      if (!VD)
+        llvm::report_fatal_error("This must have a ValueDecl");
+
+      auto key = std::make_pair(VariableName, VD->getDeclContext());
+      if (MadeIntoPointers.count(key) == 0)
+        return;
+
+      std::string NewDRE = "*" + VariableName;
+      llvm::Error Err = Replace[FileName].add(Replacement(
+          VD->getASTContext().getSourceManager(),
+          CharSourceRange::getTokenRange(DRE->getSourceRange()), NewDRE));
+      // If there is an error, I will assume that this is due to that
+      // being a wrapper call or something, so we would not want to
+      // replace anyway
+
+      // if (Err)
+      // llvm::report_fatal_error(std::move(Err));
+    }
   }
 
   void PrintClasses() const {
@@ -382,6 +420,9 @@ private:
       FunctionForwardDeclarations;
   std::unordered_map<int64_t, std::unordered_set<std::string>>
       WrapperFunctionDefinitions;
+  // The DeclContext this was declared in. Not sure how this will work
+  // with shadowing (this set is not unordered due to hashing issues).
+  std::set<std::pair<std::string, const DeclContext *>> MadeIntoPointers;
 
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
@@ -539,8 +580,9 @@ private:
       return "int";
 
     if (CurrentTypename.rfind("std::", 0) ==
-        0) // pos=0 limits the search to the prefix)
-      return CurrentTypename;
+        0)                     // pos=0 limits the search to the prefix)
+      return QT.getAsString(); // Not CurrentTypename because we want to keep
+                               // qualifiers
 
     QualType CurrentQT = QT;
 
@@ -1759,6 +1801,13 @@ private:
   void AddClassUsage(const DeclaratorDecl *DD, const std::string &FileName) {
     QualType Type = GetBaseType(DD->getType().getUnqualifiedType());
 
+    // If this is a RecordType that is not a pointer or a reference,
+    // it will be made into a pointer and this fact must be recorded
+    if (!(DD->getType()->isPointerType() || DD->getType()->isReferenceType() ||
+          DD->getType()->isLValueReferenceType()) &&
+        Type->isRecordType())
+      MadeIntoPointers.emplace(DD->getNameAsString(), DD->getDeclContext());
+
     // This handles simple typedefs to built in types
     if (Type->isBuiltinType() && Type->getTypeClassName() == "Elaborated") {
       std::string NewDeclaration =
@@ -2174,15 +2223,23 @@ private:
             clang::dyn_cast<MemberExpr>(CE->getCallee()->IgnoreImpCasts())) {
       Expr *BaseExpr = ME->getBase()->IgnoreImpCasts();
 
-      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr)) {
-        ValueDecl *VD = DRE->getDecl();
-        CallOS << VD->getNameAsString();
-        TypesOS << BaseExpr->getType().getAsString() + "*";
+      ValueDecl *VD = nullptr;
 
-        if (CE->getNumArgs() > 0) {
-          CallOS << ", ";
-          TypesOS << ", ";
-        }
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr))
+        VD = DRE->getDecl();
+      else if (MemberExpr *ME = dyn_cast<MemberExpr>(BaseExpr))
+        VD = ME->getMemberDecl();
+
+      if (!VD)
+        llvm::report_fatal_error(
+            "Expr used to access a record type not implemented");
+
+      CallOS << VD->getNameAsString();
+      TypesOS << BaseExpr->getType().getAsString() + "*";
+
+      if (CE->getNumArgs() > 0) {
+        CallOS << ", ";
+        TypesOS << ", ";
       }
     }
 
@@ -2883,6 +2940,7 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(FunctionMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);
   Finder.addMatcher(EnumConstantUsage, &YM);
+  Finder.addMatcher(PotentialPointerMatcher, &YM);
 
   auto result = Tool.run(newFrontendActionFactory(&Finder).get());
 
