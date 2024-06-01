@@ -1,6 +1,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_YALLA_UTILITIES_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_YALLA_UTILITIES_H
 
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -233,5 +234,56 @@ void StoreInNewFiles(clang::Rewriter &Rewrite,
     std::filesystem::remove(TemporaryFilename);
   }
 }
+
+class DAG {
+public:
+  std::unordered_set<int64_t> Nodes;
+  std::unordered_map<int64_t, std::unordered_set<int64_t>> Dependencies;
+
+  void AddNode(int64_t Node) { Nodes.insert(Node); }
+
+  // N2 depends on N1 (N2 uses N1)
+  void AddDependency(int64_t N1, int64_t N2) {
+    if (Nodes.count(N1) == 0 || Nodes.count(N2) == 0)
+      llvm::report_fatal_error(
+          "Adding dependencies using nodes that don't exist");
+    Dependencies[N1].insert(N2);
+  }
+
+  std::vector<int64_t> TopologicalSort() const {
+    std::unordered_map<int64_t, int> InDegree;
+    for (const auto &[Node, Deps] : Dependencies) {
+      for (int64_t N : Deps)
+        InDegree[N]++;
+    }
+
+    std::queue<int64_t> Worklist;
+    for (const auto &[Node, Deps] : Dependencies) {
+      if (InDegree[Node] == 0)
+        Worklist.push(Node);
+    }
+
+    std::vector<int64_t> Order;
+    while (Worklist.size() > 0) {
+      int64_t current = Worklist.front();
+      Worklist.pop();
+      Order.push_back(current);
+
+      auto it = Dependencies.find(current);
+      if (it == Dependencies.end())
+        continue;
+
+      const std::unordered_set<int64_t> &CurrentDependencies = it->second;
+      for (int64_t Neighbor : CurrentDependencies) {
+        InDegree[Neighbor]--;
+
+        if (InDegree[Neighbor] == 0)
+          Worklist.push(Neighbor);
+      }
+    }
+
+    return Order;
+  }
+};
 
 #endif

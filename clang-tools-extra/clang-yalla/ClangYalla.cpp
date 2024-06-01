@@ -112,6 +112,25 @@ public:
 
   virtual void onEndOfTranslationUnit() override {
     std::string AllForwardDeclarations = "";
+
+    // Ordering is necessary since classes might depend on each other.
+    const std::vector<int64_t> ClassOrder = ClassDag.TopologicalSort();
+    for (int64_t NodeID : ClassOrder) {
+      if (DeclarationsUsed.count(NodeID) == 0)
+        continue;
+
+      if (ClassForwardDeclarations.count(NodeID) == 0)
+        llvm::report_fatal_error("Trying to add a class forward decl even "
+                                 "though it does not have any");
+
+      for (const std::string &ForwardDeclaration :
+           ClassForwardDeclarations[NodeID])
+        AllForwardDeclarations += ForwardDeclaration;
+
+      // We don't want to add it again in the next loop
+      ClassForwardDeclarations.erase(NodeID);
+    }
+
     for (const auto &[NodeID, ForwardDeclarations] : ClassForwardDeclarations) {
       if (DeclarationsUsed.count(NodeID) > 0) {
         for (const std::string &ForwardDeclaration : ForwardDeclarations)
@@ -412,7 +431,7 @@ private:
   std::unordered_set<std::string> ClassTemplateInstantiations;
   std::unordered_set<std::string> FunctionTemplateInstantiations;
 
-  std::unordered_set<int64_t> DeclarationsUsed;
+  mutable std::unordered_set<int64_t> DeclarationsUsed;
   std::unordered_set<int64_t> DeclarationsSeen;
   std::unordered_map<int64_t, std::vector<std::string>>
       ClassForwardDeclarations;
@@ -423,6 +442,7 @@ private:
   // The DeclContext this was declared in. Not sure how this will work
   // with shadowing (this set is not unordered due to hashing issues).
   std::set<std::pair<std::string, const DeclContext *>> MadeIntoPointers;
+  mutable DAG ClassDag;
 
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
@@ -561,6 +581,7 @@ private:
     if (const clang::AutoType *AT = dyn_cast<clang::AutoType>(T))
       return getTypeDecl(AT->getDeducedType());
 
+    QT->dump();
     llvm::report_fatal_error("Could not get Decl for QualType");
   }
 
@@ -1439,8 +1460,31 @@ private:
       }
 
       std::string DefaultValue;
-      if (AsParameters && getDefaultTemplateArgument(ND, DefaultValue))
+      int64_t TypeID;
+      if (AsParameters &&
+          getDefaultTemplateArgument(ND, DefaultValue, TypeID)) {
         ParameterName += " = " + DefaultValue;
+
+        // Means that this is a record type defined in our substituted
+        // header. We want to record that we are using this (since it
+        // will be in our forward declaration) and add the info to the
+        // ClassDag.
+        if (DeclarationsSeen.count(TypeID) > 0) {
+          // Made DeclarationsUsed and ClassDAG mutable because of this
+          DeclarationsUsed.insert(TypeID);
+
+          if (const ClassTemplateDecl *CTD = dyn_cast<ClassTemplateDecl>(TD)) {
+            int64_t ID;
+            const RecordDecl *Definition =
+                CTD->getTemplatedDecl()->getDefinition();
+            if (Definition)
+              ID = Definition->getID();
+            else
+              ID = CTD->getTemplatedDecl()->getID();
+            ClassDag.AddDependency(TypeID, ID);
+          }
+        }
+      }
 
       if (AsParameters && TypenameType[TypenameType.size() - 1] != ' ')
         TypenameType += " ";
@@ -1536,6 +1580,7 @@ private:
     FullyScopedName += Name;
 
     int64_t ID = getRDDefinitionID(RD);
+    ClassDag.AddNode(ID);
 
     if (Classes.find(FullyScopedName) == Classes.end()) {
       std::string ForwardDeclaration =
@@ -1575,6 +1620,8 @@ private:
       ID = Definition->getID();
     else
       ID = CTD->getTemplatedDecl()->getID();
+
+    ClassDag.AddNode(ID);
 
     if (Classes.find(FullyScopedName) == Classes.end()) {
       std::string ForwardDeclaration = GenerateClassForwardDeclaration(
@@ -2927,14 +2974,44 @@ private:
     return false;
   }
 
-  bool getDefaultTemplateArgument(const NamedDecl *ND,
-                                  std::string &Value) const {
+  // Check if a NamedDecl is a template type or non type parameter and
+  // return true if it has a default value. The default value is
+  // stored as a string in Value and its ID is stored in DefaultID.
+  // If the type was not a record DefaultID is set to -1.
+  bool getDefaultTemplateArgument(const NamedDecl *ND, std::string &Value,
+                                  int64_t &DefaultID) const {
     if (const TemplateTypeParmDecl *TTPD = dyn_cast<TemplateTypeParmDecl>(ND)) {
-      if (TTPD->hasDefaultArgument()) {
-        Value =
-            GetParameterType(TTPD->getDefaultArgument(), ND->getASTContext());
-        return true;
+      if (!TTPD->hasDefaultArgument())
+        return false;
+
+      // Store the value in the string
+      QualType QT = TTPD->getDefaultArgument();
+      Value = GetParameterType(QT, ND->getASTContext());
+
+      // Now get the type's ID
+      int64_t ID = -1;
+      QT = GetBaseType(QT.getUnqualifiedType());
+      if (QT->isRecordType() || QT->isEnumeralType()) {
+        const Decl *TypeDecl = getTypeDecl(QT);
+
+        if (const RecordDecl *RD = dyn_cast<RecordDecl>(TypeDecl)) {
+          ID = getRDDefinitionID(RD);
+        } else if (const EnumDecl *ED = dyn_cast<EnumDecl>(TypeDecl)) {
+          ID = getEDDefinitionID(ED);
+        } else if (const ClassTemplateDecl *CTD =
+                       dyn_cast<ClassTemplateDecl>(TypeDecl)) {
+          const RecordDecl *Definition =
+              CTD->getTemplatedDecl()->getDefinition();
+          if (Definition)
+            ID = Definition->getID();
+          else
+            ID = CTD->getTemplatedDecl()->getID();
+        }
       }
+
+      DefaultID = ID;
+      return true;
+
     } else if (const NonTypeTemplateParmDecl *NTPD =
                    clang::dyn_cast<NonTypeTemplateParmDecl>(ND)) {
       if (NTPD->hasDefaultArgument()) {
