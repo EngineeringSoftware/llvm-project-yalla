@@ -98,6 +98,11 @@ StatementMatcher EnumConstantUsage =
     declRefExpr(to(enumConstantDecl())).bind("EnumConstantUsage");
 StatementMatcher PotentialPointerMatcher =
     declRefExpr().bind("PotentialPointer");
+StatementMatcher NewExprMatcher = cxxNewExpr().bind("NewExpr");
+
+DeclarationMatcher AliasMatcher = typedefNameDecl().bind("Typedef");
+
+auto ImplicitInitializerMatcher = cxxCtorInitializer().bind("Initializer");
 
 class YallaMatcher : public MatchFinder::MatchCallback {
 public:
@@ -314,7 +319,18 @@ public:
                 "ConstructorCall")) {
       std::string FileName = GetContainingFile(CE);
       if (isDefinedInMainSourceFile(FileName))
-        AddConstructorUsage(CE);
+        AddConstructorUsage(CE, FileName);
+    }
+
+    if (const CXXNewExpr *CNE =
+            Result.Nodes.getNodeAs<clang::CXXNewExpr>("NewExpr")) {
+      const CXXConstructExpr *CCE = CNE->getConstructExpr();
+      if (!CCE)
+        return;
+
+      std::string FileName = GetContainingFile(CCE);
+      if (isDefinedInMainSourceFile(FileName))
+        AddConstructorUsage(CCE, FileName, CNE);
     }
 
     if (const DeclRefExpr *DRE =
@@ -361,6 +377,35 @@ public:
 
       // if (Err)
       // llvm::report_fatal_error(std::move(Err));
+    }
+
+    if (const TypedefNameDecl *TND =
+            Result.Nodes.getNodeAs<TypedefNameDecl>("Typedef")) {
+      if (isFromStandardLibrary(TND))
+        return;
+
+      std::string FileName = GetContainingFile(TND);
+      if (inSubstitutedHeader(FileName)) {
+        AddAliasInfo(TND, FileName);
+      }
+    }
+
+    if (const CXXCtorInitializer *CCI =
+            Result.Nodes.getNodeAs<CXXCtorInitializer>("Initializer")) {
+      const Expr *E = CCI->getInit();
+      if (!E)
+        return;
+
+      const CXXConstructExpr *CCE = dyn_cast<CXXConstructExpr>(E);
+      if (!CCE)
+        return;
+
+      std::string FileName = GetContainingFile(CCE);
+      if (!isDefinedInMainSourceFile(FileName))
+        return;
+
+      if (!CCI->isWritten())
+        ImplicitCtorInitializers.insert(CCE);
     }
   }
 
@@ -443,6 +488,12 @@ private:
   // with shadowing (this set is not unordered due to hashing issues).
   std::set<std::pair<std::string, const DeclContext *>> MadeIntoPointers;
   mutable DAG ClassDag;
+
+  // Implicitly generated Ctor initializers we want to mark as skip
+  // because they mess up code generation (specifically functor.hpp)
+  std::unordered_set<const CXXConstructExpr *> ImplicitCtorInitializers;
+
+  std::unordered_map<int64_t, std::string> AliasMap;
 
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
@@ -581,8 +632,131 @@ private:
     if (const clang::AutoType *AT = dyn_cast<clang::AutoType>(T))
       return getTypeDecl(AT->getDeducedType());
 
-    QT->dump();
     llvm::report_fatal_error("Could not get Decl for QualType");
+  }
+
+  // This is to handle typename Base::Ch that appears in
+  // prettywriter.h in the String() method
+  bool getDependentTypeActualType(const QualType &QT, const ASTContext &Context,
+                                  std::string &Result) const {
+    const clang::Type *T = GetBaseType(QT).getTypePtr();
+
+    // At the start, this is a "typename Base::Ch", and we don't
+    // know what Base is
+
+    if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(T)) {
+      const NestedNameSpecifier *NNS = ET->getQualifier();
+
+      const clang::Type *NamedType = ET->getNamedType().getTypePtr();
+      // Dumping NamedType reveals
+      // TypedefType 0x557f1c1d7450 'rapidjson::PrettyWriter::Ch' sugar
+      // dependent
+      // |-Typedef 0x557f1c1d6aa0 'Ch'
+      // `-DependentNameType 0x557f1c1d6a30 'typename Base::Ch' dependent
+
+      if (const TypedefType *TT = dyn_cast<TypedefType>(NamedType)) {
+        clang::TypedefNameDecl *TDDecl = TT->getDecl();
+
+        QualType Underlying = TDDecl->getUnderlyingType();
+        // The underlying type is
+        // DependentNameType 0x557f1c1d6a30 'typename Base::Ch' dependent
+
+        // We now check if Base is a DependentNameType that needs to
+        // be resolved. Here Base is typedeffed earlier in the
+        // class.
+
+        const DependentNameType *DNT =
+            dyn_cast<DependentNameType>(Underlying.getTypePtr());
+        if (DNT) {
+          std::string DeclWeAreLookingFor =
+              DNT->getIdentifier()->getName().str();
+          // This will be Ch. Essentially we want to split "Base"
+          // and "Ch", resolve "Base", and find the type of "Ch" in
+          // it and return that
+
+          const NestedNameSpecifier *NNSforDNT = DNT->getQualifier();
+          if (NNSforDNT) {
+            // NNSforDNT is "Base::"
+
+            const clang::Type *AsType = NNSforDNT->getAsType();
+            if (AsType) {
+              // AsType is
+              // TypedefType 0x557f1c1d6980 'rapidjson::PrettyWriter::Base'
+              // sugar dependent
+              // |-Typedef 0x557f1c1d6920 'Base'
+              // `-ElaboratedType 0x557f1c1d6870 'Writer<OutputStream,
+              // SourceEncoding, TargetEncoding, StackAllocator, writeFlags>'
+              // sugar dependent
+              //   `-TemplateSpecializationType 0x557f1c1d67c0
+              //   'Writer<OutputStream, SourceEncoding, TargetEncoding,
+              //   StackAllocator, writeFlags>' dependent Writer
+              //     |-TemplateArgument type 'OutputStream'
+              //     | `-TemplateTypeParmType 0x557f1c1d5ce0 'OutputStream'
+              //     dependent depth 0 index 0 |   `-TemplateTypeParm
+              //     0x557f1c1d5c88 'OutputStream'
+              //     |-TemplateArgument type 'SourceEncoding'
+              //     | `-TemplateTypeParmType 0x557f1c1d5df0 'SourceEncoding'
+              //     dependent depth 0 index 1 |   `-TemplateTypeParm
+              //     0x557f1c1d5da0 'SourceEncoding'
+              //     |-TemplateArgument type 'TargetEncoding'
+              //     | `-TemplateTypeParmType 0x557f1c1d5f00 'TargetEncoding'
+              //     dependent depth 0 index 2 |   `-TemplateTypeParm
+              //     0x557f1c1d5eb0 'TargetEncoding'
+              //     |-TemplateArgument type 'StackAllocator'
+              //     | `-TemplateTypeParmType 0x557f1c1d5f90 'StackAllocator'
+              //     dependent depth 0 index 3 |   `-TemplateTypeParm
+              //     0x557f1c1d5f40 'StackAllocator'
+              //     `-TemplateArgument expr
+              //       `-DeclRefExpr 0x557f1c1d67a0 'unsigned int'
+              //       NonTypeTemplateParm 0x557f1c1d5ff8 'writeFlags' 'unsigned
+              //       int'
+
+              if (const TypedefType *TT2 = dyn_cast<TypedefType>(AsType)) {
+                const QualType InnerType2 = TT2->desugar();
+                const clang::Type *InnerType2Ptr = TT2->desugar().getTypePtr();
+
+                if (const ElaboratedType *ET2 =
+                        dyn_cast<ElaboratedType>(InnerType2Ptr)) {
+                  const Decl *TD = getTypeDecl(InnerType2);
+
+                  const ClassTemplateDecl *CTD =
+                      dyn_cast<ClassTemplateDecl>(TD);
+                  const RecordDecl *RD;
+
+                  // We have now found the definition of the class
+                  // (what "Base" resolves to), so we iterate to find "Ch"
+
+                  if (CTD)
+                    RD = CTD->getTemplatedDecl();
+                  else
+                    RD = dyn_cast<RecordDecl>(TD);
+
+                  if (RD) {
+                    for (const Decl *RDDecl : RD->decls()) {
+                      if (const TypeDecl *TDInner =
+                              dyn_cast<TypeDecl>(RDDecl)) {
+                        if (TDInner->getNameAsString() == DeclWeAreLookingFor) {
+                          Qualifiers qs;
+                          QualType FoundIt = Context.getQualifiedType(
+                              TDInner->getTypeForDecl(), qs);
+                          if (FoundIt.isNull()) {
+                            return false;
+                          }
+                          Result = GetParameterType(FoundIt, Context);
+                          return true;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   std::string GetParameterType(const QualType &QT,
@@ -616,10 +790,8 @@ private:
 
       if (T->isBuiltinType() || T->isTemplateTypeParmType() ||
           T->isConstantArrayType() || T->isDependentSizedArrayType() ||
-          T->isVectorType()) {
-        // return CurrentQT.getDesugaredType(Context).getAsString();
+          T->isVectorType())
         return QT.getAsString();
-      }
 
       if (T->isRecordType() || T->isEnumeralType()) {
         auto [Scopes, ScopesOnly] =
@@ -1047,6 +1219,11 @@ private:
       QualType ReturnType = FD->getReturnType();
 
       WrapperReturnType = GetParameterType(ReturnType, FD->getASTContext());
+      std::string PotentialResult;
+      if (getDependentTypeActualType(ReturnType, FD->getASTContext(),
+                                     PotentialResult))
+        WrapperReturnType = PotentialResult;
+
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
           WrapperReturnType += "*";
@@ -1200,6 +1377,14 @@ private:
       WrapperName = "Wrapper_" + OriginalName;
       WrapperReturnType = GetParameterType(ReturnType, FTD->getASTContext());
 
+      std::string PotentialResult;
+      if (getDependentTypeActualType(ReturnType, FD->getASTContext(),
+                                     PotentialResult))
+        WrapperReturnType = PotentialResult;
+
+      if (WrapperReturnType == "_Bool")
+        WrapperReturnType = "bool";
+
       if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
         if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
           WrapperReturnType += "*";
@@ -1301,7 +1486,13 @@ private:
     // Add the first argument as yalla_object if FD is a method, while
     // making sure to add template params e.g. <T, U, ...>
     if (FD->isCXXClassMember() && !clang::isa<CXXConstructorDecl>(FD)) {
-      Parameters += YallaObjectTemplateTypename + "* " + YallaObject + ", ";
+      // If this is a const method add "const" to the yalla object
+      std::string ConstQualifier = "";
+      if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD))
+        ConstQualifier = MD->isConst() ? "const " : "";
+
+      Parameters += ConstQualifier + YallaObjectTemplateTypename + "* " +
+                    YallaObject + ", ";
       FunctionArguments.emplace_back(YallaObject);
       FunctionArgumentTypes.emplace_back(ClassName);
     }
@@ -1329,7 +1520,14 @@ private:
       } else {
         // Keep the original qualifiers in this case
         ParamType = GetParameterType(Param->getType(), FD->getASTContext());
+        // ParamType = getDependentTypeActualType(Param->getType(),
+        // FD->getASTContext(), FD->getNameAsString() == "String");
       }
+
+      std::string PotentialReplacement;
+      if (getDependentTypeActualType(Param->getType(), FD->getASTContext(),
+                                     PotentialReplacement))
+        ParamType = PotentialReplacement;
 
       if (ParamType == "_Bool")
         ParamType = "bool";
@@ -1441,6 +1639,8 @@ private:
                 dyn_cast<NonTypeTemplateParmDecl>(ND)) {
           QualType ParamType = NTTP->getType();
           TypenameType = ParamType.getAsString();
+          if (TypenameType == "_Bool")
+            TypenameType = "bool";
         } else {
           TypenameType = "typename";
         }
@@ -1706,6 +1906,20 @@ private:
     if (!NewlyInserted) {
       EI->second.HasDefinition |= HasDefinition;
     }
+  }
+
+  void ResolveType(QualType QT) const {}
+
+  void AddAliasInfo(const TypedefNameDecl *TND, const std::string &Filename) {
+    std::string Name = TND->getNameAsString();
+    QualType Underlying = TND->getUnderlyingType();
+
+    // auto [Scopes, FullyScopedName] = GetScopes(TND);
+    // if (!FullyScopedName.empty())
+    //   FullyScopedName += "::";
+    // FullyScopedName += Name;
+
+    // TND->getID();
   }
 
   std::pair<std::string, std::unordered_map<std::string, std::string>>
@@ -1976,6 +2190,15 @@ private:
         llvm::report_fatal_error(std::move(Err));
     }
 
+    if ((DD->getType()->isPointerType() || DD->getType()->isReferenceType() ||
+         DD->getType()->isLValueReferenceType()) &&
+        GetBaseType(DD->getType())->isTypedefNameType()) {
+      llvm::Error Err = Replace[FileName].add(Replacement(
+          DD->getASTContext().getSourceManager(), Range, NewDeclaration));
+      if (Err)
+        llvm::report_fatal_error(std::move(Err));
+    }
+
     ClassInfo &CI = it->second;
     CI.Usages.emplace_back(DD->getNameAsString(), Type.getAsString(), Filename,
                            Type->isReferenceType() || Type->isPointerType(), DD,
@@ -1999,8 +2222,21 @@ private:
         return;
 
       const clang::Expr *Init = VD->getInit();
-      if (const CXXConstructExpr *CE = clang::dyn_cast<clang::CXXConstructExpr>(
-              Init->IgnoreUnlessSpelledInSource())) {
+      const clang::Expr *InitIgnoreUnless = Init->IgnoreUnlessSpelledInSource();
+
+      const CXXConstructExpr *CE = nullptr;
+      CharSourceRange Range;
+      if (const CXXConstructExpr *tempCE =
+              dyn_cast<CXXConstructExpr>(InitIgnoreUnless)) {
+        CE = tempCE;
+        Range = CharSourceRange::getTokenRange(tempCE->getSourceRange());
+      } else if (const CXXNewExpr *tempCNE =
+                     dyn_cast<CXXNewExpr>(InitIgnoreUnless)) {
+        CE = tempCNE->getConstructExpr();
+        Range = CharSourceRange::getTokenRange(tempCNE->getSourceRange());
+      }
+
+      if (CE) {
 
         // Represents the <T, U, ...> at the end of a constructor
         std::string TypenameSuffix = "";
@@ -2103,8 +2339,7 @@ private:
           ReplaceWith = VD->getNameAsString() + " = " + ReplaceWith;
 
         llvm::Error Err = Replace[FileName].add(Replacement(
-            DD->getASTContext().getSourceManager(),
-            CharSourceRange::getTokenRange(CE->getSourceRange()), ReplaceWith));
+            DD->getASTContext().getSourceManager(), Range, ReplaceWith));
         if (Err)
           llvm::report_fatal_error(std::move(Err));
       }
@@ -2602,10 +2837,15 @@ private:
     }
   }
 
-  void AddConstructorUsage(const CXXConstructExpr *CE) {
+  void AddConstructorUsage(const CXXConstructExpr *CE,
+                           const std::string &FileName,
+                           const CXXNewExpr *CNE = nullptr) {
     const CXXConstructorDecl *FD = CE->getConstructor();
 
     if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
+      return;
+
+    if (ImplicitCtorInitializers.count(CE) != 0)
       return;
 
     auto [Scopes, FullyScopedName] = GetScopes(FD);
@@ -2619,6 +2859,9 @@ private:
     const clang::CXXConstructorDecl *CD = CE->getConstructor();
     const clang::CXXRecordDecl *RD = CD->getParent();
 
+    // Need to add the template args here (copied from
+    // AddClassUsage())
+    std::string TemplateArgs = "";
     if (const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate()) {
       TypenameSuffix = GetTemplateTypenames(CTD, false);
     } else if (const ClassTemplateSpecializationDecl *CTSD =
@@ -2626,6 +2869,9 @@ private:
       const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate();
       if (CTD)
         TypenameSuffix = GetTemplateTypenames(CTD, false);
+
+      auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
+      TemplateArgs = ClassTemplateArgs;
     }
 
     FullyScopedName += TypenameSuffix;
@@ -2646,20 +2892,34 @@ private:
     std::string Filename = GetContainingFile(CE);
 
     auto [WrapperCall, WrapperArgumentTypes] =
-        GetWrapperCall(WrapperIt->second.WrapperName, CE);
+        GetWrapperCall(WrapperIt->second.WrapperName, CE, TemplateArgs);
 
-    SourceLocation BeginLoc = CE->getBeginLoc();
-    SourceLocation EndLoc = CE->getEndLoc();
-    SourceRange SR = CE->getSourceRange();
+    CharSourceRange Range;
+    if (CNE)
+      Range = CharSourceRange::getTokenRange(CNE->getSourceRange());
+    else
+      Range = CharSourceRange::getTokenRange(CE->getSourceRange());
 
-    if (BeginLoc == EndLoc) {
-      // Constructor is of the form Kokkos::View V;
-      CharSourceRange Range = CharSourceRange::getTokenRange(BeginLoc, EndLoc);
+    llvm::Error Err = Replace[FileName].add(Replacement(
+        FD->getASTContext().getSourceManager(), Range, WrapperCall));
 
-      // llvm::Error Err = Replace[Filename].add(Replacement(*SM, Range,
-      // WrapperCall)); if (Err)
-      //   llvm::report_fatal_error(std::move(Err));
-    }
+    // The replacement for the new expr might overlap with the
+    // replacement for the construct expr, but that's okay because we
+    // will match the new expr first.
+
+    // if (Err)
+    //   llvm::report_fatal_error(std::move(Err));
+
+    // if (BeginLoc == EndLoc) {
+    //   // Constructor is of the form Kokkos::View V;
+    //   CharSourceRange Range = CharSourceRange::getTokenRange(BeginLoc,
+    //   EndLoc);
+
+    //   llvm::Error Err = Replace[Filename].add(Replacement(*SM, Range,
+    //   WrapperCall));
+    //   if (Err)
+    //     llvm::report_fatal_error(std::move(Err));
+    // }
     //  else if (BeginLoc == SR.getBegin()) {
     // Constructor is of the form Kokkos::View V(4);
 
@@ -3164,9 +3424,12 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(EnumMatcher, &YM);
   Finder.addMatcher(ClassUsageMatcher, &YM);
   Finder.addMatcher(FunctionMatcher, &YM);
+  Finder.addMatcher(NewExprMatcher, &YM);
   Finder.addMatcher(FunctionCallMatcher, &YM);
   Finder.addMatcher(EnumConstantUsage, &YM);
   Finder.addMatcher(PotentialPointerMatcher, &YM);
+  Finder.addMatcher(AliasMatcher, &YM);
+  Finder.addMatcher(ImplicitInitializerMatcher, &YM);
 
   auto result = Tool.run(newFrontendActionFactory(&Finder).get());
 
