@@ -102,6 +102,9 @@ StatementMatcher NewExprMatcher = cxxNewExpr().bind("NewExpr");
 
 DeclarationMatcher AliasMatcher = typedefNameDecl().bind("Typedef");
 
+auto MemberAccessVariableMatcher =
+    memberExpr(unless(hasDescendant(callExpr()))).bind("MemberVariableAccess");
+
 auto ImplicitInitializerMatcher = cxxCtorInitializer().bind("Initializer");
 
 class YallaMatcher : public MatchFinder::MatchCallback {
@@ -367,10 +370,10 @@ public:
       if (MadeIntoPointers.count(key) == 0)
         return;
 
-      std::string NewDRE = "*" + VariableName;
-      llvm::Error Err = Replace[FileName].add(Replacement(
-          VD->getASTContext().getSourceManager(),
-          CharSourceRange::getTokenRange(DRE->getSourceRange()), NewDRE));
+      // std::string NewDRE = "*" + VariableName;
+      // llvm::Error Err = Replace[FileName].add(Replacement(
+      //     VD->getASTContext().getSourceManager(),
+      //     CharSourceRange::getTokenRange(DRE->getSourceRange()), NewDRE));
       // If there is an error, I will assume that this is due to that
       // being a wrapper call or something, so we would not want to
       // replace anyway
@@ -406,6 +409,15 @@ public:
 
       if (!CCI->isWritten())
         ImplicitCtorInitializers.insert(CCE);
+    }
+
+    if (const MemberExpr *ME =
+            Result.Nodes.getNodeAs<MemberExpr>("MemberVariableAccess")) {
+      std::string FileName = GetContainingFile(ME);
+      if (!isDefinedInMainSourceFile(FileName))
+        return;
+
+      AddMemberVariableUsage(ME);
     }
   }
 
@@ -494,6 +506,8 @@ private:
   std::unordered_set<const CXXConstructExpr *> ImplicitCtorInitializers;
 
   std::unordered_map<int64_t, std::string> AliasMap;
+
+  int64_t CurrentWrapperIndex = 0;
 
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
@@ -774,9 +788,9 @@ private:
             std::string::npos) // pos=0 limits the search to the prefix)
       return "int";
 
-    if (CurrentTypename.rfind("std::", 0) ==
-        0)                     // pos=0 limits the search to the prefix)
+    if (CurrentTypename.rfind("std::", 0) == 0)
       return QT.getAsString(); // Not CurrentTypename because we want to keep
+                               // pos=0 limits the search to the prefix)
                                // qualifiers
 
     QualType CurrentQT = QT;
@@ -812,6 +826,30 @@ private:
           T->isMemberPointerType()) {
         CurrentQT = T->getPointeeType();
         continue;
+      }
+
+      if (T->getTypeClassName() == "Elaborated") {
+        const ElaboratedType *ET = dyn_cast<ElaboratedType>(T);
+        if (!ET)
+          llvm::report_fatal_error("ET can't be null");
+
+        CurrentQT = ET->getNamedType();
+        continue;
+      }
+
+      if (const TypedefType *TT = CurrentQT->getAs<TypedefType>()) {
+        // This is to handle the return type of Peek() in the following case
+        // ```
+        // template <typename InputStream, typename Encoding = UTF8<> >
+        // class GenericStreamWrapper {
+        // public:
+        //     typedef typename Encoding::Ch Ch;
+        //     Ch Peek() const { return is_.Peek(); }
+        // ```
+        // It returns "typename Encoding::Ch"
+        const TypedefNameDecl *TND = TT->getDecl();
+        QualType UnderlyingType = TND->getUnderlyingType();
+        return UnderlyingType.getAsString();
       }
 
       if (const AutoType *AT = T->getContainedAutoType())
@@ -1539,17 +1577,17 @@ private:
         ArgumentName =
             std::string("yalla_placeholder_arg_") + std::to_string(current);
 
-      // This means the parameter has a default value
-      if (Param->hasInit()) {
-        LangOptions LangOpts;
-        PrintingPolicy Policy(LangOpts);
-        Policy.adjustForCPlusPlus();
+      // // This means the parameter has a default value
+      // if (Param->hasInit()) {
+      //   LangOptions LangOpts;
+      //   PrintingPolicy Policy(LangOpts);
+      //   Policy.adjustForCPlusPlus();
 
-        const Expr *Default = Param->getInit();
-        std::string DefaultValue;
-        if (getCompileTimeValue(Default, FD->getASTContext(), DefaultValue))
-          ArgumentName += " = " + DefaultValue;
-      }
+      //   const Expr *Default = Param->getInit();
+      //   std::string DefaultValue;
+      //   if (getCompileTimeValue(Default, FD->getASTContext(), DefaultValue))
+      //     ArgumentName += " = " + DefaultValue;
+      // }
 
       Parameters += " ";
       Parameters += ArgumentName;
@@ -1880,15 +1918,15 @@ private:
         GetParameterType(ED->getIntegerType(), ED->getASTContext());
 
     if (Enums.find(FullyScopedName) == Enums.end()) {
-      std::string ForwardDeclaration =
-          GenerateEnumForwardDeclaration(ED, IsScoped, Size, Scopes);
-      loc = ED->getASTContext().getSourceManager().getLocForStartOfFile(
-          ED->getASTContext().getSourceManager().getMainFileID());
-      MainFilename = FileName;
-      SM = &(ED->getASTContext().getSourceManager());
+      // std::string ForwardDeclaration =
+      //     GenerateEnumForwardDeclaration(ED, IsScoped, Size, Scopes);
+      // loc = ED->getASTContext().getSourceManager().getLocForStartOfFile(
+      //     ED->getASTContext().getSourceManager().getMainFileID());
+      // MainFilename = FileName;
+      // SM = &(ED->getASTContext().getSourceManager());
 
-      ClassForwardDeclarations[ED->getID()].push_back(
-          std::move(ForwardDeclaration));
+      // ClassForwardDeclarations[ED->getID()].push_back(
+      //     std::move(ForwardDeclaration));
     }
 
     DeclarationsSeen.insert(ED->getID());
@@ -1897,7 +1935,7 @@ private:
     for (const EnumConstantDecl *ECD : ED->enumerators()) {
       EnumeratorValuePairs.emplace_back(ECD->getNameAsString(),
                                         llvm::toString(ECD->getInitVal(), 10));
-      AddEnumConstantWrapper(ED, ECD, FullyScopedName);
+      AddEnumConstantWrapper(ED, ECD, FullyScopedName, Size);
     }
 
     auto [EI, NewlyInserted] =
@@ -2133,19 +2171,21 @@ private:
     // it will be made into a pointer and this fact must be recorded
     if (!(DD->getType()->isPointerType() || DD->getType()->isReferenceType() ||
           DD->getType()->isLValueReferenceType()) &&
-        Type->isRecordType())
-      MadeIntoPointers.emplace(DD->getNameAsString(), DD->getDeclContext());
+        Type->isRecordType()) {
+      const Decl *D = getTypeDecl(Type);
+      if (inSubstitutedHeader(GetContainingFile(D)))
+        MadeIntoPointers.emplace(DD->getNameAsString(), DD->getDeclContext());
+    }
 
     // This handles simple typedefs to built in types
     if (Type->isBuiltinType() && Type->getTypeClassName() == "Elaborated") {
       std::string NewDeclaration =
           Type.getDesugaredType(DD->getASTContext()).getAsString();
-      CharSourceRange Range = CharSourceRange::getTokenRange(
-          // DD->getTypeSourceInfo()->getTypeLoc().getSourceRange());
-          DD->getTypeSourceInfo()
-              ->getTypeLoc()
-              .getNextTypeLoc()
-              .getSourceRange());
+      CharSourceRange Range =
+          CharSourceRange::getTokenRange(DD->getTypeSourceInfo()
+                                             ->getTypeLoc()
+                                             .getNextTypeLoc()
+                                             .getSourceRange());
       llvm::Error Err = Replace[FileName].add(Replacement(
           DD->getASTContext().getSourceManager(), Range, NewDeclaration));
       if (Err)
@@ -2210,6 +2250,16 @@ private:
           DD->getASTContext().getSourceManager(), Range, NewDeclaration));
       if (Err)
         llvm::report_fatal_error(std::move(Err));
+    } else if (GetBaseType(RemoveElaboratedAndTypedef(DD->getType()))
+                   ->isRecordType()) {
+      // This is for
+      // cv::InputArray arg0 = objpt;
+      // in 3calibration.cpp
+
+      llvm::Error Err = Replace[FileName].add(Replacement(
+          DD->getASTContext().getSourceManager(), Range, NewDeclaration));
+      if (Err)
+        llvm::report_fatal_error(std::move(Err));
     }
 
     if ((DD->getType()->isPointerType() || DD->getType()->isReferenceType() ||
@@ -2245,6 +2295,7 @@ private:
 
       const clang::Expr *Init = VD->getInit();
       const clang::Expr *InitIgnoreUnless = Init->IgnoreUnlessSpelledInSource();
+      const clang::Expr *InitIgnoreImplicitCasts = Init->IgnoreImplicit();
 
       const CXXConstructExpr *CE = nullptr;
       CharSourceRange Range;
@@ -2256,6 +2307,14 @@ private:
                      dyn_cast<CXXNewExpr>(InitIgnoreUnless)) {
         CE = tempCNE->getConstructExpr();
         Range = CharSourceRange::getTokenRange(tempCNE->getSourceRange());
+      } else if (const CXXConstructExpr *tempCE2 =
+                     dyn_cast<CXXConstructExpr>(InitIgnoreImplicitCasts)) {
+        // This is for
+        // cv::InputArray arg0 = objpt;
+        // in 3calibration.cpp
+
+        CE = tempCE2;
+        Range = CharSourceRange::getTokenRange(tempCE2->getSourceRange());
       }
 
       if (CE && !DD->getType()->isPointerType()) {
@@ -2585,17 +2644,24 @@ private:
       Expr *BaseExpr = ME->getBase()->IgnoreImpCasts();
 
       ValueDecl *VD = nullptr;
+      std::string Value;
 
       if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr))
-        VD = DRE->getDecl();
+        Value = DRE->getDecl()->getNameAsString();
       else if (MemberExpr *ME = dyn_cast<MemberExpr>(BaseExpr))
-        VD = ME->getMemberDecl();
-
-      if (!VD)
+        Value = ME->getMemberDecl()->getNameAsString();
+      else if (ArraySubscriptExpr *ASE =
+                   dyn_cast<ArraySubscriptExpr>(BaseExpr)) {
+        llvm::raw_string_ostream ASEOS(Value);
+        ASE->printPretty(ASEOS, nullptr, Policy, 0);
+        ASEOS.flush();
+      } else {
+        BaseExpr->dumpColor();
         llvm::report_fatal_error(
             "Expr used to access a record type not implemented");
+      }
 
-      CallOS << VD->getNameAsString();
+      CallOS << Value;
       TypesOS << BaseExpr->getType().getAsString() + "*";
 
       if (CE->getNumArgs() > 0) {
@@ -2700,6 +2766,15 @@ private:
       const Decl *ReturnTypeDecl = getTypeDecl(ReturnType);
       AddReturnTypeToUsages(ReturnTypeDecl);
     }
+
+    const clang::Type *T = ReturnType.getTypePtr();
+    if (const ElaboratedType *ET = dyn_cast<ElaboratedType>(T)) {
+      if (const TemplateSpecializationType *TST =
+              dyn_cast<TemplateSpecializationType>(
+                  ET->getNamedType().getTypePtr())) {
+        AddUsagesFromTemplateSpecialization(TST);
+      }
+    }
   }
 
   void AddReturnTypeToUsages(const Decl *ReturnTypeDecl) {
@@ -2766,7 +2841,7 @@ private:
     return false;
   }
 
-  std::string GetNewWrapperReturnType(const Expr *CE, const FunctionDecl *FD,
+  std::string GetNewWrapperReturnType(const Expr *CE, const Decl *FD,
                                       const std::string &ClassName) const {
     QualType QT = CE->getType();
     std::string WrapperReturnType =
@@ -2774,8 +2849,27 @@ private:
 
     // std::string WrapperReturnType = GetParameterType(CE->getType(),
     // FD->getASTContext());
-    if (QT->isRecordType())
-      WrapperReturnType += "*";
+    if (QT->isRecordType()) {
+      const Decl *TD = getTypeDecl(QT);
+      std::string Filename = GetContainingFile(TD);
+      if (inSubstitutedHeader(Filename))
+        WrapperReturnType += "*";
+    }
+
+    if (QT->isEnumeralType()) {
+      const Decl *TD = getTypeDecl(QT);
+      const EnumDecl *ED = dyn_cast<EnumDecl>(TD);
+      if (!ED)
+        llvm::report_fatal_error("ED cannot be null here\n");
+      std::string EnumSize =
+          GetParameterType(ED->getIntegerType(), ED->getASTContext());
+      return EnumSize;
+    }
+
+    if (const FunctionDecl *ActualFD = dyn_cast<FunctionDecl>(FD)) {
+      if (!QT->isRecordType() && ActualFD->getReturnType()->isReferenceType())
+        WrapperReturnType += "&";
+    }
 
     // Currently happening for chat_server.cpp, for a bool casting
     // operator overload
@@ -2790,8 +2884,9 @@ private:
   }
 
   std::string GetNewWrapperName(const FunctionDecl *FD,
-                                const std::string &ClassName) const {
+                                const std::string &ClassName) {
     std::string WrapperName;
+    int64_t CurrentIndex = CurrentWrapperIndex++;
 
     if (clang::isa<CXXDestructorDecl>(FD)) {
       WrapperName = "Wrapper_" + ClassName + "_destructor";
@@ -2822,7 +2917,9 @@ private:
       WrapperName = "Wrapper_" + OriginalName;
     }
 
-    return WrapperName;
+    return WrapperName + "_" +
+           std::to_string(
+               CurrentIndex); // To avoid overloading functions by return type
   }
 
   // Return an empty string if this is not a member expr
@@ -2833,17 +2930,24 @@ private:
       Expr *BaseExpr = ME->getBase()->IgnoreImpCasts();
 
       ValueDecl *VD = nullptr;
+      std::string Value;
 
       if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(BaseExpr))
-        VD = DRE->getDecl();
+        Value = DRE->getDecl()->getNameAsString();
       else if (MemberExpr *ME = dyn_cast<MemberExpr>(BaseExpr))
-        VD = ME->getMemberDecl();
+        Value = ME->getMemberDecl()->getNameAsString();
+      // else if (ArraySubscriptExpr *ASE =
+      // dyn_cast<ArraySubscriptExpr>(BaseExpr)) {
+      else {
+        LangOptions LangOpts;
+        PrintingPolicy Policy(LangOpts);
+        Policy.adjustForCPlusPlus();
+        llvm::raw_string_ostream ASEOS(Value);
+        BaseExpr->printPretty(ASEOS, nullptr, Policy, 0);
+        ASEOS.flush();
+      }
 
-      if (!VD)
-        llvm::report_fatal_error(
-            "Expr used to access a record type not implemented");
-
-      return VD->getNameAsString();
+      return Value;
     }
 
     return "";
@@ -2912,7 +3016,7 @@ private:
   // A vector of argument names in the function definition: ["a", "b", ...]
   // A vector of instantiated parameter types: ["int", "double", ...]
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
-  GetNewWrapperParamInfo(const CallExpr *CE) const {
+  GetNewWrapperParamInfo(const CallExpr *CE) {
     const FunctionDecl *FD = CE->getDirectCallee();
     std::string InstantiatedParameters = "";
     std::vector<std::string> NewWrapperParameters;
@@ -2924,7 +3028,13 @@ private:
     if (const CXXMemberCallExpr *CCE = dyn_cast<CXXMemberCallExpr>(CE)) {
       std::string TypeName =
           GetTypeWithAllScopes(CCE->getObjectType(), FD->getASTContext());
-      TypeName += "*";
+
+      std::string DefinitionFilename = GetContainingFile(FD);
+      if (!inSubstitutedHeader(DefinitionFilename))
+        TypeName += "&"; // The type will still be complete so we make it into a
+                         // reference
+      else
+        TypeName += "*";
       InstantiatedParameters += TypeName + ", ";
       NewWrapperParameters.push_back(YallaObject);
       NewWrapperParameterTypes.push_back(TypeName);
@@ -2951,7 +3061,7 @@ private:
   // A vector of argument names in the function definition: ["a", "b", ...]
   // A vector of instantiated parameter types: ["int", "double", ...]
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
-  GetNewWrapperParamInfo(const CXXConstructExpr *CE) const {
+  GetNewWrapperParamInfo(const CXXConstructExpr *CE) {
     const FunctionDecl *FD = CE->getConstructor();
 
     return GetNewWrapperParamInfo<CXXConstructExpr>(CE, FD);
@@ -2962,7 +3072,7 @@ private:
   // other than Expr
   template <typename CallT>
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
-  GetNewWrapperParamInfo(const CallT *CE, const FunctionDecl *FD) const {
+  GetNewWrapperParamInfo(const CallT *CE, const FunctionDecl *FD) {
     std::string InstantiatedParameters = "";
     std::vector<std::string> NewWrapperParameters;
     std::vector<std::string> NewWrapperParameterTypes;
@@ -2971,7 +3081,10 @@ private:
     for (const auto &Arg : CE->arguments()) {
       std::string ParamType =
           GetTypeWithAllScopes(Arg->getType(), FD->getASTContext());
-      if (ShouldBeMadeIntoPointer(Arg->getType()))
+      AddReturnTypeToUsages(GetBaseType(Arg->getType()));
+
+      QualType ActualType = RemoveElaboratedAndTypedef(Arg->getType());
+      if (ShouldBeMadeIntoPointer(ActualType))
         ParamType += "*";
 
       // std::string ParamName = Arg->getNameAsString();
@@ -2989,13 +3102,16 @@ private:
           std::string DefaultValue;
           if (getCompileTimeValue(Default, FD->getASTContext(), DefaultValue))
             ParamName += " = " + DefaultValue;
+          else {
+            ParamName += " = nullptr";
+          }
         }
       }
 
       // Check if it is a reference (only for args we have not made
       // pointers). This might be true for classes defined in the
       // source files.
-      if (!ShouldBeMadeIntoPointer(Arg->getType()) &&
+      if (!ShouldBeMadeIntoPointer(ActualType) &&
           current < FD->getNumParams()) {
         const ParmVarDecl *PVD = FD->getParamDecl(current);
         if (PVD->getType()->isReferenceType())
@@ -3022,7 +3138,7 @@ private:
   // namespace N1{ ..." The second is the end of the namespace declarations:
   // "... } }" The third is scoping operator: "N0::N1::"
   std::tuple<std::string, std::string, std::string>
-  GetNamespace(const FunctionDecl *FD) const {
+  GetNamespace(const Decl *FD) const {
     auto [Scopes, FullyScopedName] = GetScopes(FD);
 
     std::string NamespaceStart = "";
@@ -3038,6 +3154,50 @@ private:
     }
 
     return {NamespaceStart, NamespaceEnd, ScopingOperator};
+  }
+
+  void AddNewWrappers(const MemberExpr *ME) {
+    const ValueDecl *VD = ME->getMemberDecl();
+    std::string ObjectName = GetMethodCallObjectName(ME);
+
+    std::string TypeName =
+        GetTypeWithAllScopes(ME->getBase()->getType(), VD->getASTContext());
+    TypeName += "*";
+
+    std::string NewWrapperName = "MemberWrapper_" + VD->getNameAsString();
+    std::string NewWrapperReturnType = GetNewWrapperReturnType(ME, VD, "");
+    NewWrapperReturnType += "&";
+
+    auto [NamespaceStart, NamespaceEnd, ScopingOperator] = GetNamespace(VD);
+
+    CharSourceRange Range =
+        CharSourceRange::getTokenRange(ME->getBeginLoc(), ME->getEndLoc());
+
+    std::string NewWrapper = NamespaceStart + NewWrapperReturnType + " " +
+                             NewWrapperName + "(" + TypeName + ");\n" +
+                             NamespaceEnd;
+    std::string NewWrapperCall =
+        ScopingOperator + NewWrapperName + "(" + ObjectName + ")";
+
+    std::string Filename = GetContainingFile(ME);
+    llvm::Error Err = Replace[Filename].add(Replacement(
+        VD->getASTContext().getSourceManager(), Range, NewWrapperCall));
+    if (Err)
+      llvm::report_fatal_error(std::move(Err));
+
+    FunctionForwardDeclarations[VD->getID()].insert(NewWrapper);
+  }
+
+  // Function to check if two replacements overlap
+  bool ReplacementsOverlap(const Replacement &existing,
+                           const Replacement &newReplacement) const {
+    unsigned existingStart = existing.getOffset();
+    unsigned existingEnd = existingStart + existing.getLength();
+    unsigned newStart = newReplacement.getOffset();
+    unsigned newEnd = newStart + newReplacement.getLength();
+
+    // Check if there is any overlap
+    return existingStart < newEnd && newStart < existingEnd;
   }
 
   void AddNewWrappers(const CallExpr *CE) {
@@ -3080,10 +3240,63 @@ private:
         CharSourceRange::getTokenRange(CE->getBeginLoc(), CE->getEndLoc());
 
     std::string Filename = GetContainingFile(CE);
-    llvm::Error Err = Replace[Filename].add(Replacement(
-        FD->getASTContext().getSourceManager(), Range, NewWrapperCall));
-    if (Err)
+    Replacement NewReplacement(FD->getASTContext().getSourceManager(), Range,
+                               NewWrapperCall);
+    llvm::Error Err = Replace[Filename].add(NewReplacement);
+    if (Err && FD->getNameAsString() == "imread") {
+      bool Overlaps = false;
+      Replacement OverlappingReplacement;
+      for (const Replacement &Existing : Replace[Filename]) {
+        if (ReplacementsOverlap(Existing, NewReplacement)) {
+          Overlaps = true;
+          OverlappingReplacement = Existing;
+          break;
+        }
+      }
+
+      if (Overlaps) {
+        std::string MergedReplacementText = OverlappingReplacement.toString();
+
+        LangOptions LangOpts;
+        PrintingPolicy Policy(LangOpts);
+        Policy.adjustForCPlusPlus();
+        std::string ExistingExpr;
+
+        llvm::raw_string_ostream ExprOS(ExistingExpr);
+        CE->printPretty(ExprOS, nullptr, Policy, 0);
+        ExprOS.flush();
+
+        MergedReplacementText.replace(MergedReplacementText.find(ExistingExpr),
+                                      ExistingExpr.length(), NewWrapperCall);
+
+        Replacement MergedReplacement(OverlappingReplacement.getFilePath(),
+                                      OverlappingReplacement.getOffset(),
+                                      OverlappingReplacement.getLength(),
+                                      MergedReplacementText);
+        Replacements NewReplacements;
+
+        for (const Replacement &Existing : Replace[Filename]) {
+          if (ReplacementsOverlap(Existing, NewReplacement)) {
+            llvm::Error Err2 = NewReplacements.add(MergedReplacement);
+            if (Err2) {
+              std::cout << "got err 2 merged\n";
+              llvm::report_fatal_error(std::move(Err2));
+            }
+
+          } else {
+            llvm::Error Err2 = NewReplacements.add(Existing);
+            if (Err2) {
+              std::cout << "got err 2 existing\n";
+              llvm::report_fatal_error(std::move(Err2));
+            }
+          }
+        }
+
+        Replace[Filename] = NewReplacements;
+      }
+    } else if (Err) {
       llvm::report_fatal_error(std::move(Err));
+    }
 
     const FunctionDecl *SeenDecl = GetOriginalFunctionDeclFromInstantiation(FD);
     FunctionForwardDeclarations[SeenDecl->getID()].insert(NewWrapper);
@@ -3242,10 +3455,102 @@ private:
                                  std::move(NewWrapperParameterTypes));
   }
 
+  void AddMemberVariableUsage(const MemberExpr *ME) {
+    const ValueDecl *VD = ME->getMemberDecl();
+
+    if (isFromStandardLibrary(VD) || isDefinedInMainSourceFile(VD))
+      return;
+
+    if (isa<FunctionDecl>(VD))
+      return;
+
+    DeclarationsUsed.insert(VD->getID());
+    AddNewWrappers(ME);
+  }
+
+  QualType RemoveElaboratedAndTypedef(const QualType &QT) const {
+    QualType Result = QT;
+    const clang::Type *T = QT.getTypePtr();
+
+    if (T->getTypeClassName() == "Elaborated") {
+      const ElaboratedType *ET = dyn_cast<ElaboratedType>(T);
+      if (!ET)
+        llvm::report_fatal_error("ET can't be null");
+
+      Result = ET->getNamedType();
+    }
+
+    if (const TypedefType *TT = Result->getAs<TypedefType>()) {
+      // This is to handle the return type of Peek() in the following case
+      // ```
+      // template <typename InputStream, typename Encoding = UTF8<> >
+      // class GenericStreamWrapper {
+      // public:
+      //     typedef typename Encoding::Ch Ch;
+      //     Ch Peek() const { return is_.Peek(); }
+      // ```
+      // It returns "typename Encoding::Ch"
+      const TypedefNameDecl *TND = TT->getDecl();
+      Result = TND->getUnderlyingType();
+    }
+
+    return Result;
+  }
+
+  bool UsesIncompleteTypeAsTemplateArgument(const CXXRecordDecl *RD) const {
+    const ClassTemplateSpecializationDecl *CTSD =
+        dyn_cast<ClassTemplateSpecializationDecl>(RD);
+    if (!CTSD)
+      return false;
+
+    for (const TemplateArgument &TA : CTSD->getTemplateArgs().asArray()) {
+      if (TA.getKind() != clang::TemplateArgument::Type)
+        continue;
+
+      if (ShouldBeMadeIntoPointer(TA.getAsType()))
+        return true;
+    }
+
+    return false;
+  }
+
   void AddFunctionUsage(const CallExpr *CE) {
     const FunctionDecl *FD = CE->getDirectCallee();
+    std::string DefinitionFilename = GetContainingFile(FD);
 
-    if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
+    if (isDefinedInMainSourceFile(FD))
+      return;
+
+    bool ArgumentsWillBeMadePointers = false;
+    // if (!inSubstitutedHeader(GetContainingFile(FD))) {
+    for (const Expr *E : CE->arguments()) {
+      QualType ExprType = RemoveElaboratedAndTypedef(GetBaseType(E->getType()));
+      if (ShouldBeMadeIntoPointer(ExprType) ||
+          (ExprType->isReferenceType() &&
+           ShouldBeMadeIntoPointer(ExprType->getPointeeType()))) {
+        ArgumentsWillBeMadePointers = true;
+        break;
+      }
+    }
+    // }
+
+    bool ReturnTypeShouldBeMadePointer =
+        ShouldBeMadeIntoPointer(FD->getReturnType());
+
+    // This is motivated by vector.resize(), which fails if you call
+    // it on a vector of incomplete types.
+    bool IsMethodOfTemplatedClassThatUsesIncompleteType = false;
+    const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD);
+    if (MD) {
+      const CXXRecordDecl *RD = MD->getParent();
+      if (RD)
+        IsMethodOfTemplatedClassThatUsesIncompleteType =
+            UsesIncompleteTypeAsTemplateArgument(RD);
+    }
+
+    if (!inSubstitutedHeader(GetContainingFile(FD)) &&
+        !(ArgumentsWillBeMadePointers || ReturnTypeShouldBeMadePointer ||
+          IsMethodOfTemplatedClassThatUsesIncompleteType))
       return;
 
     if (hasUnresolvedUsingParamType(FD))
@@ -3257,12 +3562,15 @@ private:
       FullyScopedName += "::";
     FullyScopedName += FD->getNameAsString();
 
-    if (isTemplateInstantiation(FD)) {
-      if (TemplatedFunctions.find(FullyScopedName) == TemplatedFunctions.end())
-        return;
-    } else {
-      if (Functions.find(FullyScopedName) == Functions.end())
-        return;
+    if (inSubstitutedHeader(DefinitionFilename)) {
+      if (isTemplateInstantiation(FD)) {
+        if (TemplatedFunctions.find(FullyScopedName) ==
+            TemplatedFunctions.end())
+          return;
+      } else {
+        if (Functions.find(FullyScopedName) == Functions.end())
+          return;
+      }
     }
 
     if (isTemplateInstantiation(FD) && !FD->isCXXClassMember()) {
@@ -3277,8 +3585,10 @@ private:
 
     const FunctionDecl *SeenDecl = GetOriginalFunctionDeclFromInstantiation(FD);
 
-    if (DeclarationsSeen.count(SeenDecl->getID()) == 0)
-      llvm::report_fatal_error("Function usage appears before definition");
+    if (inSubstitutedHeader(DefinitionFilename)) {
+      if (DeclarationsSeen.count(SeenDecl->getID()) == 0)
+        llvm::report_fatal_error("Function usage appears before definition");
+    }
 
     DeclarationsUsed.insert(SeenDecl->getID());
 
@@ -3289,50 +3599,19 @@ private:
       AddReturnTypeToUsages(QT);
     }
 
-    // if (FunctionNeedsWrapper(FD)) {
-    //   auto WrapperIt = FunctionWrappers.find(FullyScopedName);
-    //   if (WrapperIt == FunctionWrappers.end())
-    //     llvm::report_fatal_error("Function needs wrapper but none found");
-
-    //   const WrapperInfo &WI = WrapperIt->second;
-    //   std::string Filename = GetContainingFile(CE);
-
-    //   auto [WrapperTemplateArgs, TemplateParameterToArgument] =
-    //       GetWrapperTemplateArgs(CE);
-
-    //   CharSourceRange Range =
-    //       CharSourceRange::getTokenRange(CE->getBeginLoc(), CE->getEndLoc());
-
-    //   auto [WrapperCall, WrapperArgumentTypes] =
-    //       GetWrapperCall(WI.WrapperName, CE, WrapperTemplateArgs);
-
-    //   if (WrapperTemplateArgs != "") {
-    //     // std::string WrapperInstantiation = "template " + WI.WrapperName +
-    //     // WrapperTemplateArgs + "(";
-    //     FunctionTemplateInstantiations.insert(
-    //         "template " + WI.WrapperReturnType + " " + WI.WrapperName +
-    //         WrapperTemplateArgs + "(" + WrapperArgumentTypes + ");\n");
-    //     // FunctionTemplateInstantiations +=
-    //     // GetTemplatedWrapperInstantiation(WrapperIt->second,
-    //     // WrapperTemplateArgs, WrapperArgumentTypes,
-    //     // TemplateParameterToArgument);
-    //   }
-
-    //   llvm::Error Err = Replace[Filename].add(Replacement(
-    //       FD->getASTContext().getSourceManager(), Range, WrapperCall));
-    //   if (Err)
-    //     llvm::report_fatal_error(std::move(Err));
-    // }
-
-    if (FD->isTemplateInstantiation() || FD->isCXXClassMember()) {
+    if (FD->isTemplateInstantiation() || FD->isCXXClassMember() ||
+        ArgumentsWillBeMadePointers || ReturnTypeShouldBeMadePointer ||
+        IsMethodOfTemplatedClassThatUsesIncompleteType) {
       AddNewWrappers(CE);
     }
 
-    std::vector<FunctionUsage> &Usages =
-        isTemplateInstantiation(FD)
-            ? TemplatedFunctions.find(FullyScopedName)->second.Usages
-            : Functions.find(FullyScopedName)->second.Usages;
-    Usages.emplace_back(FD->getNameAsString());
+    if (inSubstitutedHeader(DefinitionFilename)) {
+      std::vector<FunctionUsage> &Usages =
+          isTemplateInstantiation(FD)
+              ? TemplatedFunctions.find(FullyScopedName)->second.Usages
+              : Functions.find(FullyScopedName)->second.Usages;
+      Usages.emplace_back(FD->getNameAsString());
+    }
 
     // if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
     // No point in instantiating methods
@@ -3463,16 +3742,18 @@ private:
   }
 
   void AddEnumConstantWrapper(const EnumDecl *ED, const EnumConstantDecl *ECD,
-                              const std::string &FullyScopedName) {
+                              const std::string &FullyScopedName,
+                              const std::string &EnumSize) {
     std::string WrapperName =
         "EnumWrapper_" + ED->getNameAsString() + "_" + ECD->getNameAsString();
-    std::string WrapperReturnType = FullyScopedName;
+    // std::string WrapperReturnType = FullyScopedName;
+    std::string WrapperReturnType = EnumSize;
 
     std::string EnumConstantScopedName =
         FullyScopedName + "::" + ECD->getNameAsString();
 
     std::string WrapperFunctionSignature =
-        FullyScopedName + " " + WrapperName + "()";
+        WrapperReturnType + " " + WrapperName + "()";
     std::string WrapperDefinitionBody =
         "return " + EnumConstantScopedName + ";";
     std::string WrapperFunctionDefinition =
@@ -3560,6 +3841,10 @@ private:
 
   std::string GetContainingFile(const DeclRefExpr *DRE) const {
     return SM->getFilename(DRE->getBeginLoc()).str();
+  }
+
+  std::string GetContainingFile(const MemberExpr *ME) const {
+    return SM->getFilename(ME->getBeginLoc()).str();
   }
 
   std::string GetContainingFile(const CXXConstructExpr *CE) const {
@@ -3966,6 +4251,7 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(PotentialPointerMatcher, &YM);
   Finder.addMatcher(AliasMatcher, &YM);
   Finder.addMatcher(ImplicitInitializerMatcher, &YM);
+  Finder.addMatcher(MemberAccessVariableMatcher, &YM);
 
   auto result = Tool.run(newFrontendActionFactory(&Finder).get());
 
