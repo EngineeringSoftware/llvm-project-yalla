@@ -155,8 +155,19 @@ public:
     }
 
     if (AllForwardDeclarations != "")
-      Replace[MainFilename].add(
-          Replacement(*SM, loc, 0, AllForwardDeclarations));
+      WriteWrapperDeclarations(AllForwardDeclarations, WrapperDeclarationsFile);
+
+    std::string DefaultArgsMacroDefine =
+        "#define " + WrapperDefaultArgsMacro + "\n";
+    std::string WrapperDeclarationsInclude =
+        "#include \"" + WrapperDeclarationsFile + "\"\n";
+    Replace[MainFilename].add(Replacement(
+        *SM, loc, 0, DefaultArgsMacroDefine + WrapperDeclarationsInclude));
+
+    for (const std::string &InputHeader : InputHeaderPaths) {
+      Replace[InputHeader].add(
+          Replacement(InputHeader, 0, 0, WrapperDeclarationsInclude));
+    }
   }
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
@@ -508,7 +519,12 @@ private:
   std::unordered_map<int64_t, std::string> AliasMap;
 
   int64_t CurrentWrapperIndex = 0;
+  const std::string WrapperDefaultArgsMacro = "YALLA_KEEP_DEFAULT_ARGS";
 
+public:
+  const std::string WrapperDeclarationsFile = "wrappers.yalla.h";
+
+private:
   bool inSubstitutedHeader(const std::string &Filename) const {
     if (HeaderDirectoryPath == "")
       return Filename == HeaderPath;
@@ -1128,6 +1144,11 @@ private:
                     YallaObject + "->" + TemplateKeyword + FunctionName +
                     TemplateArguments + JoinedArguments +
                     DynamicallyAllocatedConstructorEnd + ";\n";
+
+      // Happening in rapidjson
+      if (WrapperBody == "return yalla_object->operator bool "
+                         "(rapidjson::ParseResult::*)() const();\n")
+        WrapperBody = "return static_cast<bool>(*yalla_object);\n";
       break;
     }
     case WrapperInfo::Function:
@@ -1701,7 +1722,8 @@ private:
       int64_t TypeID;
       if (AsParameters &&
           getDefaultTemplateArgument(ND, DefaultValue, TypeID)) {
-        ParameterName += " = " + DefaultValue;
+        ParameterName += "\n#ifdef " + WrapperDefaultArgsMacro + "\n" + " = " +
+                         DefaultValue + "\n #endif\n";
 
         // Means that this is a record type defined in our substituted
         // header. We want to record that we are using this (since it
@@ -2221,8 +2243,24 @@ private:
     // Copied from below, need to replace the template parameters in
     // the return type with the arguments it is being instantiated
     // with
-    if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
-      if (const auto *RT = TST->getAs<RecordType>()) {
+
+    const auto *TST = Type->getAs<TemplateSpecializationType>();
+    const SubstTemplateTypeParmType *STTP;
+    const RecordType *RT;
+
+    if (TST) {
+      RT = TST->getAs<RecordType>();
+    } else {
+      // For class usages that are substitutions of template paramater
+      // types, we need to go through one more layer
+      STTP = Type->getAs<SubstTemplateTypeParmType>();
+      if (STTP) {
+        RT = STTP->getReplacementType()->getAs<RecordType>();
+      }
+    }
+
+    if (TST || STTP) {
+      if (RT) {
         if (const auto *CTSD =
                 dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
           // Still need to add scoping stuff
@@ -2232,7 +2270,8 @@ private:
         }
       }
 
-      AddUsagesFromTemplateSpecialization(TST);
+      if (TST)
+        AddUsagesFromTemplateSpecialization(TST);
     }
 
     if (NewDeclaration == "")
@@ -2771,6 +2810,10 @@ private:
     if (WrapperReturnType == "BooleanType")
       WrapperReturnType = "bool";
 
+    // Currently happening for capitalize.cpp
+    if (WrapperReturnType == "bool (rapidjson::ParseResult::*)() const")
+      WrapperReturnType = "bool";
+
     return WrapperReturnType;
   }
 
@@ -2949,7 +2992,8 @@ private:
 
   // This returns a tuple of three things:
   // The joined instantiated parameters: "(int, double, ...)""
-  // A vector of argument names in the function definition: ["a", "b", ...]
+  // A vector of argument names in the function definition: ["a", "b", ...] as
+  // they are supposed to appear in the inner function call (with dereferences)
   // A vector of instantiated parameter types: ["int", "double", ...]
   std::tuple<std::string, std::vector<std::string>, std::vector<std::string>>
   GetNewWrapperParamInfo(const CXXConstructExpr *CE) {
@@ -2975,42 +3019,53 @@ private:
       AddReturnTypeToUsages(GetBaseType(Arg->getType()));
 
       QualType ActualType = RemoveElaboratedAndTypedef(Arg->getType());
-      if (ShouldBeMadeIntoPointer(ActualType))
+      bool MakeIntoPointer = ShouldBeMadeIntoPointer(ActualType);
+      std::string Dereference;
+      if (MakeIntoPointer) {
         ParamType += "*";
+        Dereference = "*";
+      } else
+        Dereference = "";
 
-      // std::string ParamName = Arg->getNameAsString();
       std::string ParamName;
       if (current < FD->getNumParams())
         ParamName = FD->getParamDecl(current)->getNameAsString();
       else
         ParamName = "YallaParam_" + std::to_string(current);
 
+      // Create a copy with the default arg since we don't want to add
+      // the default arg to the actual function call
+      std::string ParamNameWithDefaultArg = ParamName;
       // Add the default value of the parameter
       if (current < FD->getNumParams()) {
         const ParmVarDecl *PVD = FD->getParamDecl(current);
         if (PVD->hasInit()) {
           const Expr *Default = PVD->getInit();
+
+          std::string DefaultArg;
           std::string DefaultValue;
           if (getCompileTimeValue(Default, FD->getASTContext(), DefaultValue))
-            ParamName += " = " + DefaultValue;
+            DefaultArg = " = " + DefaultValue;
           else {
-            ParamName += " = nullptr";
+            DefaultArg = " = nullptr";
           }
+          ParamNameWithDefaultArg += "\n#ifdef " + WrapperDefaultArgsMacro +
+                                     "\n" + DefaultArg + "\n #endif\n";
         }
       }
 
       // Check if it is a reference (only for args we have not made
       // pointers). This might be true for classes defined in the
       // source files.
-      if (!ShouldBeMadeIntoPointer(ActualType) &&
-          current < FD->getNumParams()) {
+      if (!MakeIntoPointer && current < FD->getNumParams()) {
         const ParmVarDecl *PVD = FD->getParamDecl(current);
         if (PVD->getType()->isReferenceType())
           ParamType += "&";
       }
 
-      InstantiatedParameters += ParamType + " " + ParamName + ", ";
-      NewWrapperParameters.push_back(ParamName);
+      InstantiatedParameters +=
+          ParamType + " " + ParamNameWithDefaultArg + ", ";
+      NewWrapperParameters.push_back(Dereference + ParamName);
       NewWrapperParameterTypes.push_back(ParamType);
       current++;
     }
@@ -3200,8 +3255,15 @@ private:
     FunctionForwardDeclarations[SeenDecl->getID()].insert(
         NewWrapperDeclaration);
 
-    // Now create the wrapper definitions
     bool ReturnsClassByValue = false;
+    QualType ReturnType = SeenDecl->getReturnType();
+    if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
+      if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
+        ReturnsClassByValue = true;
+      }
+    }
+
+    // Now create the wrapper definitions
     std::string FunctionName = FD->getNameAsString();
     auto [Scopes, FullyScopedName] = GetScopes(FD);
     if (!FullyScopedName.empty())
@@ -3342,9 +3404,13 @@ private:
       FDFullyScopedName += "::";
     FDFullyScopedName += FunctionName;
 
+    std::string ConstructorCall = NewWrapperReturnType;
+    while (ConstructorCall.back() == ' ' || ConstructorCall.back() == '*')
+      ConstructorCall.pop_back();
+
     std::string NewWrapperDefinition = GenerateWrapperDefinition(
         NewWrapperSignature, NewWrapperReturnType, ReturnsClassByValue,
-        FunctionName, FDFullyScopedName, FullyScopedClassName,
+        FunctionName, FDFullyScopedName, ConstructorCall,
         WrapperInfo::WrapperType::Constructor, std::move(NewWrapperParameters),
         "");
 
