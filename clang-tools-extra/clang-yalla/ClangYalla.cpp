@@ -1091,7 +1091,8 @@ private:
       const std::string &FullyScopedClassName,
       WrapperInfo::WrapperType WrapperType,
       std::vector<std::string> &&WrapperArguments,
-      std::string &&TemplateArguments) const {
+      std::string &&TemplateArguments, bool YallaObjectIsReference = false,
+      const std::string &ObjectNameInWrapper = "") const {
     std::string WrapperBody;
     std::string JoinedArguments = "";
 
@@ -1117,9 +1118,15 @@ private:
     if (ReturnsClassByValue) {
       std::string ConstructorCall = ReturnType;
 
-      if (ConstructorCall.back() != '*')
-        llvm::report_fatal_error("Attempting to return class by pointer when "
-                                 "the return type is not a pointer");
+      // while (ConstructorCall.back() == ' ')
+      //   ConstructorCall.pop_back();
+
+      // if (ConstructorCall.back() != '*') {
+      //   std::cout << ConstructorCall << '\n';
+      //   llvm::report_fatal_error("Attempting to return class by pointer when
+      //   "
+      //                            "the return type is not a pointer");
+      // }
 
       ConstructorCall.pop_back();
       DynamicallyAllocatedConstructorStart = "new " + ConstructorCall + "(";
@@ -1134,6 +1141,7 @@ private:
       WrapperBody = "return new " + FullyScopedClassName + TemplateArguments +
                     JoinedArguments + ";\n";
       break;
+    case WrapperInfo::StaticMethod:
     case WrapperInfo::Method: {
       // see
       // https://stackoverflow.com/questions/610245/where-and-why-do-i-have-to-put-the-template-and-typename-keywords
@@ -1143,10 +1151,18 @@ private:
       else
         TemplateKeyword = "template ";
 
+      std::string MemberAccess;
+      if (WrapperType == WrapperInfo::StaticMethod) {
+        MemberAccess = FullyScopedClassName + "::";
+      } else {
+        std::string DotAccess = YallaObjectIsReference ? "." : "->";
+        MemberAccess = ObjectNameInWrapper + DotAccess + TemplateKeyword;
+      }
+
       WrapperBody = "return " + DynamicallyAllocatedConstructorStart +
-                    YallaObject + "->" + TemplateKeyword + FunctionName +
-                    TemplateArguments + JoinedArguments +
-                    DynamicallyAllocatedConstructorEnd + ";\n";
+                    MemberAccess + FunctionName + TemplateArguments +
+                    JoinedArguments + DynamicallyAllocatedConstructorEnd +
+                    ";\n";
 
       // Happening in rapidjson
       if (WrapperBody == "return yalla_object->operator bool "
@@ -3134,9 +3150,12 @@ private:
     std::string TypeName =
         GetTypeWithAllScopes(ME->getBase()->getType(), VD->getASTContext());
     TypeName += "*";
+    std::string ParamName = "YallaMemberAccessObject";
 
     std::string NewWrapperName = "MemberWrapper_" + VD->getNameAsString();
     std::string NewWrapperReturnType = GetNewWrapperReturnType(ME, VD, "");
+    if (NewWrapperReturnType.back() == '*')
+      NewWrapperReturnType.pop_back();
     NewWrapperReturnType += "&";
 
     auto [NamespaceStart, NamespaceEnd, ScopingOperator] = GetNamespace(VD);
@@ -3144,9 +3163,11 @@ private:
     CharSourceRange Range =
         CharSourceRange::getTokenRange(ME->getBeginLoc(), ME->getEndLoc());
 
-    std::string NewWrapper = NamespaceStart + NewWrapperReturnType + " " +
-                             NewWrapperName + "(" + TypeName + ");\n" +
-                             NamespaceEnd;
+    std::string NewWrapperSignature = NewWrapperReturnType + " " +
+                                      NewWrapperName + "(" + TypeName + " " +
+                                      ParamName + ")";
+    std::string NewWrapperDeclaration =
+        NamespaceStart + NewWrapperSignature + ";\n" + NamespaceEnd;
     std::string NewWrapperCall =
         ScopingOperator + NewWrapperName + "(" + ObjectName + ")";
 
@@ -3156,7 +3177,13 @@ private:
     if (Err)
       llvm::report_fatal_error(std::move(Err));
 
-    FunctionForwardDeclarations[VD->getID()].insert(NewWrapper);
+    FunctionForwardDeclarations[VD->getID()].insert(NewWrapperDeclaration);
+
+    std::string NewWrapperDefinition = NewWrapperSignature + "{\n return " +
+                                       ParamName + "->" +
+                                       VD->getNameAsString() + ";\n}";
+    NewWrapperDefinition = NamespaceStart + NewWrapperDefinition + NamespaceEnd;
+    WrapperFunctionDefinitions[VD->getID()].insert(NewWrapperDefinition);
   }
 
   // Function to check if two replacements overlap
@@ -3180,13 +3207,18 @@ private:
     WrapperInfo::WrapperType WrapperType;
     if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD)) {
       ClassName = MD->getParent()->getNameAsString();
-      auto [Scopes, FullyScopedClassName] = GetScopes(MD->getParent());
+      auto [Scopes, InnerFullyScopedClassName] = GetScopes(MD->getParent());
 
-      if (!FullyScopedClassName.empty())
-        FullyScopedClassName += "::";
-      FullyScopedClassName += ClassName;
+      if (!InnerFullyScopedClassName.empty())
+        InnerFullyScopedClassName += "::";
+      InnerFullyScopedClassName += ClassName;
 
-      WrapperType = WrapperInfo::WrapperType::Method;
+      if (MD->isStatic())
+        WrapperType = WrapperInfo::WrapperType::StaticMethod;
+      else
+        WrapperType = WrapperInfo::WrapperType::Method;
+
+      FullyScopedClassName = InnerFullyScopedClassName;
     } else {
       ClassName = "";
       FullyScopedClassName = "";
@@ -3196,6 +3228,7 @@ private:
 
     auto [InstantiatedParameters, NewWrapperParameters,
           NewWrapperParameterTypes] = GetNewWrapperParamInfo(CE);
+
     std::string ObjectName =
         GetMethodCallObjectName(CE->getCallee()->IgnoreImpCasts());
     std::string Arguments =
@@ -3204,6 +3237,7 @@ private:
     std::string NewWrapperReturnType =
         GetNewWrapperReturnType(CE, CE->getDirectCallee(), ClassName);
     std::string NewWrapperName = GetNewWrapperName(FD, ClassName);
+
     auto [NamespaceStart, NamespaceEnd, ScopingOperator] = GetNamespace(FD);
 
     std::string NewWrapperSignature = NewWrapperReturnType + " " +
@@ -3282,6 +3316,7 @@ private:
 
     bool ReturnsClassByValue = false;
     QualType ReturnType = SeenDecl->getReturnType();
+    ReturnType = RemoveElaboratedAndTypedef(GetBaseType(ReturnType));
     if (const RecordDecl *RD = ReturnType->getAsRecordDecl()) {
       if (!(ReturnType->isPointerType() || ReturnType->isReferenceType())) {
         ReturnsClassByValue = true;
@@ -3295,17 +3330,8 @@ private:
       FullyScopedName += "::";
     FullyScopedName += FunctionName;
 
-    std::string NewWrapperDefinition = GenerateWrapperDefinition(
-        NewWrapperSignature, NewWrapperReturnType, ReturnsClassByValue,
-        FunctionName, FullyScopedName, FullyScopedClassName, WrapperType,
-        std::move(NewWrapperParameters), "");
-
-    NewWrapperDefinition = NamespaceStart + NewWrapperDefinition + NamespaceEnd;
-    WrapperFunctionDefinitions[SeenDecl->getID()].insert(NewWrapperDefinition);
-
-    // Everything here and below is just so we can insert this into
-    // FunctionWrappers
-
+    // Get the template args so we can pass them to
+    // GenerateWrapperDefinition (needed for static methods)
     std::string TypenameSuffix = "";
     std::string TemplateArgs = "";
 
@@ -3322,6 +3348,50 @@ private:
         TemplateArgs = ClassTemplateArgs;
       }
     }
+
+    bool YallaObjectIsReference = false;
+    if (WrapperType == WrapperInfo::Method ||
+        WrapperType == WrapperInfo::StaticMethod) {
+      if (NewWrapperParameterTypes[0].back() == '&')
+        YallaObjectIsReference = true;
+    }
+
+    // This is for operator calls, like Mat m = otherMat which uses
+    // operator=(). We will capture the yalla object from an implicit
+    // this passed by the compiler to the method. This retrieves the
+    // name used in the signature.
+    std::string ObjectNameInWrapper;
+    if (isa<CXXOperatorCallExpr>(CE)) {
+      ObjectNameInWrapper = NewWrapperParameters[0];
+      if (ObjectNameInWrapper[0] ==
+          '*') // No need to mess with dereferencing here
+        ObjectNameInWrapper.erase(0, 1);
+    } else
+      ObjectNameInWrapper = YallaObject;
+
+    const FunctionTemplateSpecializationInfo *FTSI =
+        FD->getTemplateSpecializationInfo();
+
+    std::string FunctionTemplateArgs;
+    if (FTSI) {
+      auto ArgsAndParams = GetTemplateArgs(FTSI);
+      FunctionTemplateArgs = std::get<0>(ArgsAndParams);
+    } else {
+      FunctionTemplateArgs = "";
+    }
+
+    std::string NewWrapperDefinition = GenerateWrapperDefinition(
+        NewWrapperSignature, NewWrapperReturnType, ReturnsClassByValue,
+        FunctionName, FullyScopedName, FullyScopedClassName + TemplateArgs,
+        WrapperType, std::move(NewWrapperParameters),
+        std::move(FunctionTemplateArgs), YallaObjectIsReference,
+        ObjectNameInWrapper);
+
+    NewWrapperDefinition = NamespaceStart + NewWrapperDefinition + NamespaceEnd;
+    WrapperFunctionDefinitions[SeenDecl->getID()].insert(NewWrapperDefinition);
+
+    // Everything here and below is just so we can insert this into
+    // FunctionWrappers
 
     if (isTemplateInstantiation(FD)) {
       if (const FunctionTemplateDecl *FTD =
@@ -3784,8 +3854,11 @@ private:
     // std::string WrapperReturnType = FullyScopedName;
     std::string WrapperReturnType = EnumSize;
 
-    std::string EnumConstantScopedName =
-        FullyScopedName + "::" + ECD->getNameAsString();
+    std::string EnumConstantScopedName = FullyScopedName;
+    if (ED->getNameAsString() == "")
+      EnumConstantScopedName += ECD->getNameAsString();
+    else
+      EnumConstantScopedName += "::" + ECD->getNameAsString();
 
     std::string WrapperFunctionSignature =
         WrapperReturnType + " " + WrapperName + "()";
@@ -3827,7 +3900,10 @@ private:
       FullyScopedName += "::";
     FullyScopedName += ED->getNameAsString();
 
-    FullyScopedName += "::" + ECD->getNameAsString();
+    if (ED->getNameAsString() == "")
+      FullyScopedName += ECD->getNameAsString();
+    else
+      FullyScopedName += "::" + ECD->getNameAsString();
 
     auto WrapperIt = FunctionWrappers.find(FullyScopedName);
     if (WrapperIt == FunctionWrappers.end())
