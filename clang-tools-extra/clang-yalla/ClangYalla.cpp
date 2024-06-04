@@ -1055,6 +1055,9 @@ private:
             getTypeDecl(GetBaseType(PVD->getType().getUnqualifiedType()));
         return !isDefinedInMainSourceFile(TypeDecl);
       }
+      if (PVD->getType()->isEnumeralType()) {
+        return true;
+      }
     }
 
     return false;
@@ -3019,6 +3022,28 @@ private:
       AddReturnTypeToUsages(GetBaseType(Arg->getType()));
 
       QualType ActualType = RemoveElaboratedAndTypedef(Arg->getType());
+
+      // Have to case enum types back to their actual type from the
+      // integral type
+      std::string ParamCast;
+      if (ActualType->isEnumeralType()) {
+        const Decl *TD = getTypeDecl(Arg->getType());
+        const EnumDecl *ED = dyn_cast<EnumDecl>(TD);
+
+        std::string Name = ED->getNameAsString();
+        bool HasDefinition = ED->getDefinition() != nullptr;
+
+        auto [Scopes, FullyScopedName] = GetScopes(ED);
+        if (!FullyScopedName.empty())
+          FullyScopedName += "::";
+        FullyScopedName += Name;
+
+        ParamCast = "(" + FullyScopedName + ")";
+        ParamType = GetParameterType(ED->getIntegerType(), ED->getASTContext());
+      } else {
+        ParamCast = "";
+      }
+
       bool MakeIntoPointer = ShouldBeMadeIntoPointer(ActualType);
       std::string Dereference;
       if (MakeIntoPointer) {
@@ -3065,7 +3090,7 @@ private:
 
       InstantiatedParameters +=
           ParamType + " " + ParamNameWithDefaultArg + ", ";
-      NewWrapperParameters.push_back(Dereference + ParamName);
+      NewWrapperParameters.push_back(ParamCast + Dereference + ParamName);
       NewWrapperParameterTypes.push_back(ParamType);
       current++;
     }
@@ -3550,9 +3575,17 @@ private:
             UsesIncompleteTypeAsTemplateArgument(RD);
     }
 
+    bool UsesEnum = false;
+    for (const Expr *E : CE->arguments()) {
+      if (E->getType()->isEnumeralType()) {
+        UsesEnum = true;
+        break;
+      }
+    }
+
     if (!inSubstitutedHeader(GetContainingFile(FD)) &&
         !(ArgumentsWillBeMadePointers || ReturnTypeShouldBeMadePointer ||
-          IsMethodOfTemplatedClassThatUsesIncompleteType))
+          IsMethodOfTemplatedClassThatUsesIncompleteType || UsesEnum))
       return;
 
     if (hasUnresolvedUsingParamType(FD))
@@ -3603,7 +3636,7 @@ private:
 
     if (FD->isTemplateInstantiation() || FD->isCXXClassMember() ||
         ArgumentsWillBeMadePointers || ReturnTypeShouldBeMadePointer ||
-        IsMethodOfTemplatedClassThatUsesIncompleteType) {
+        IsMethodOfTemplatedClassThatUsesIncompleteType || UsesEnum) {
       AddNewWrappers(CE);
     }
 
