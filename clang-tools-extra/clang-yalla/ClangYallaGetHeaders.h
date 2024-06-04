@@ -13,9 +13,11 @@
 using namespace clang;
 using namespace clang::tooling;
 
-// Not sure how to retrieve IncludedFiles from the below classes, so
-// it is a global variable for now
-std::vector<std::string> IncludedFiles;
+// Not sure how to retrieve GlobalIncludedFiles from the below
+// classes, so it is a global variable for now. The boolean indicates
+// that the include is angled
+std::vector<std::pair<std::string, bool>> GlobalIncludedFiles;
+std::unordered_set<std::string> GlobalSourceFiles;
 
 class IncludeFinderPPCallbacks : public PPCallbacks {
 public:
@@ -28,11 +30,21 @@ public:
                      StringRef SearchPath, StringRef RelativePath,
                      const clang::Module *Imported,
                      SrcMgr::CharacteristicKind FileType) override {
-    IncludedFiles.push_back(FileName.str());
+    std::string ContainingFile = getAbsolutePath(GetContainingFile(HashLoc));
+    if (GlobalSourceFiles.count(ContainingFile) > 0)
+      GlobalIncludedFiles.emplace_back(FileName.str(), IsAngled);
   }
 
 private:
   SourceManager &SM;
+
+  std::string GetContainingFile(const SourceLocation &Loc) const {
+    const FileEntry *Entry = SM.getFileEntryForID(SM.getFileID(Loc));
+
+    if (!Entry)
+      return "";
+    return Entry->getName().str();
+  }
 };
 
 class IncludeFinderASTConsumer : public ASTConsumer {

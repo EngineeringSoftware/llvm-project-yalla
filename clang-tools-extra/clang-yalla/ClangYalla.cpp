@@ -2320,115 +2320,6 @@ private:
       if (CE && !DD->getType()->isPointerType()) {
         AddNewWrappers(CE, Range, VD->getNameAsString());
       }
-
-      // if (CE) {
-
-      //   // Represents the <T, U, ...> at the end of a constructor
-      //   std::string TypenameSuffix = "";
-      //   std::string TemplateArgs = "";
-      //   const clang::CXXConstructorDecl *CD = CE->getConstructor();
-      //   const clang::CXXRecordDecl *RD = CD->getParent();
-
-      //   if (const ClassTemplateDecl *CTD = RD->getDescribedClassTemplate()) {
-      //     AddReturnTypeToUsages(CTD);
-      //     TypenameSuffix = GetTemplateTypenames(CTD, false);
-      //   } else if (const ClassTemplateSpecializationDecl *CTSD =
-      //                  dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
-      //     const ClassTemplateDecl *CTD = CTSD->getSpecializedTemplate();
-      //     AddReturnTypeToUsages(CTD);
-      //     TypenameSuffix = GetTemplateTypenames(CTD, false);
-      //     auto [ClassTemplateArgs, TemplateParamMap] = GetTemplateArgs(CTSD);
-      //     TemplateArgs = ClassTemplateArgs;
-      //   } else {
-      //     AddReturnTypeToUsages(RD);
-      //   }
-
-      //   // IgnoreUnlessSpelledInSource() is needed for
-      //   // "ClassWithMethod c6 = ClassWithMethod(4);"
-      //   const FunctionDecl *FD = CE->getConstructor();
-
-      //   int64_t ID;
-      //   const RecordDecl *Definition = CI.RD->getDefinition();
-      //   if (Definition)
-      //     ID = Definition->getID();
-      //   else
-      //     ID = CI.RD->getID();
-
-      //   const FunctionDecl *SeenDecl =
-      //       GetOriginalFunctionDeclFromInstantiation(FD);
-      //   if (DeclarationsSeen.count(SeenDecl->getID()) > 0)
-      //     DeclarationsUsed.insert(SeenDecl->getID());
-      //   else if (DeclarationsSeen.count(ID) > 0)
-      //     DeclarationsUsed.insert(ID);
-      //   else
-      //     llvm::report_fatal_error(
-      //         "Constructor usage appears before definition");
-
-      //   if (isTemplateInstantiation(FD)) {
-      //     if (const FunctionTemplateDecl *FTD =
-      //             FD->getDescribedFunctionTemplate()) {
-      //       FD = FTD->getTemplatedDecl();
-      //     }
-      //   }
-
-      //   auto [Scopes, FullyScopedName] = GetScopes(FD);
-      //   if (!FullyScopedName.empty())
-      //     FullyScopedName += "::";
-      //   FullyScopedName += FD->getNameAsString() + TypenameSuffix;
-
-      //   auto it = FunctionWrappers.find(FullyScopedName);
-      //   if (it == FunctionWrappers.end())
-      //     llvm::report_fatal_error(
-      //         "Found Constructor usage before definition (in class usage)");
-
-      //   std::string WrapperName = it->second.WrapperName;
-      //   auto [ReplaceWith, WrapperArgumentTypes] =
-      //       GetWrapperCall(WrapperName, CE, TemplateArgs);
-
-      //   // Need to replace the template parameters in the return type
-      //   // with the arguments it is being instantiated with
-      //   std::string ClassTemplateArgs = "";
-      //   if (const auto *TST = Type->getAs<TemplateSpecializationType>()) {
-      //     if (const auto *RT = TST->getAs<RecordType>()) {
-      //       if (const auto *CTSD =
-      //               dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl()))
-      //               {
-      //         // Still need to add scoping stuff
-      //         auto ArgsMapPair = GetTemplateArgs(CTSD);
-      //         ClassTemplateArgs = std::get<0>(ArgsMapPair);
-      //       }
-      //     }
-      //   }
-
-      //   std::string InstantiationReturnType = it->second.WrapperReturnType;
-      //   if (ClassTemplateArgs != "") {
-      //     size_t ReplaceStart = InstantiationReturnType.find('<');
-      //     size_t ReplaceEnd = InstantiationReturnType.rfind('>');
-
-      //     InstantiationReturnType.replace(ReplaceStart, ReplaceEnd,
-      //                                     ClassTemplateArgs);
-      //   }
-
-      //   if (!(*InstantiationReturnType.end() == '*'))
-      //     InstantiationReturnType += "*";
-
-      //   if (TemplateArgs != "") {
-      //     FunctionTemplateInstantiations.insert(
-      //         "template " + InstantiationReturnType + " " + WrapperName +
-      //         TemplateArgs + "(" + WrapperArgumentTypes + ");\n");
-      //   }
-
-      //   // This condition is false if the constructor does not look
-      //   // like "ClassWithMethod c6 = ClassWithMethod(4);". I'm not
-      //   // sure why, but the ranges are affected differently.
-      //   if (!clang::dyn_cast<clang::CXXFunctionalCastExpr>(Init))
-      //     ReplaceWith = VD->getNameAsString() + " = " + ReplaceWith;
-
-      //   llvm::Error Err = Replace[FileName].add(Replacement(
-      //       DD->getASTContext().getSourceManager(), Range, ReplaceWith));
-      //   if (Err)
-      //     llvm::report_fatal_error(std::move(Err));
-      // }
     }
 
     // Now add an instantiation if this is a templated class
@@ -3035,7 +2926,7 @@ private:
                          // reference
       else
         TypeName += "*";
-      InstantiatedParameters += TypeName + ", ";
+      InstantiatedParameters += TypeName + " " + YallaObject + ", ";
       NewWrapperParameters.push_back(YallaObject);
       NewWrapperParameterTypes.push_back(TypeName);
     }
@@ -3206,6 +3097,7 @@ private:
     std::string FullyScopedClassName;
     std::string ClassName;
 
+    WrapperInfo::WrapperType WrapperType;
     if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD)) {
       ClassName = MD->getParent()->getNameAsString();
       auto [Scopes, FullyScopedClassName] = GetScopes(MD->getParent());
@@ -3213,9 +3105,13 @@ private:
       if (!FullyScopedClassName.empty())
         FullyScopedClassName += "::";
       FullyScopedClassName += ClassName;
+
+      WrapperType = WrapperInfo::WrapperType::Method;
     } else {
       ClassName = "";
       FullyScopedClassName = "";
+
+      WrapperType = WrapperInfo::WrapperType::Function;
     }
 
     auto [InstantiatedParameters, NewWrapperParameters,
@@ -3230,9 +3126,11 @@ private:
     std::string NewWrapperName = GetNewWrapperName(FD, ClassName);
     auto [NamespaceStart, NamespaceEnd, ScopingOperator] = GetNamespace(FD);
 
-    std::string NewWrapper = NamespaceStart + NewWrapperReturnType + " " +
-                             NewWrapperName + "(" + InstantiatedParameters +
-                             ");\n" + NamespaceEnd;
+    std::string NewWrapperSignature = NewWrapperReturnType + " " +
+                                      NewWrapperName + "(" +
+                                      InstantiatedParameters + ")";
+    std::string NewWrapperDeclaration =
+        NamespaceStart + NewWrapperSignature + ";\n" + NamespaceEnd;
     std::string NewWrapperCall =
         ScopingOperator + NewWrapperName + "(" + Arguments + ")";
 
@@ -3299,7 +3197,24 @@ private:
     }
 
     const FunctionDecl *SeenDecl = GetOriginalFunctionDeclFromInstantiation(FD);
-    FunctionForwardDeclarations[SeenDecl->getID()].insert(NewWrapper);
+    FunctionForwardDeclarations[SeenDecl->getID()].insert(
+        NewWrapperDeclaration);
+
+    // Now create the wrapper definitions
+    bool ReturnsClassByValue = false;
+    std::string FunctionName = FD->getNameAsString();
+    auto [Scopes, FullyScopedName] = GetScopes(FD);
+    if (!FullyScopedName.empty())
+      FullyScopedName += "::";
+    FullyScopedName += FunctionName;
+
+    std::string NewWrapperDefinition = GenerateWrapperDefinition(
+        NewWrapperSignature, NewWrapperReturnType, ReturnsClassByValue,
+        FunctionName, FullyScopedName, FullyScopedClassName, WrapperType,
+        std::move(NewWrapperParameters), "");
+
+    NewWrapperDefinition = NamespaceStart + NewWrapperDefinition + NamespaceEnd;
+    WrapperFunctionDefinitions[SeenDecl->getID()].insert(NewWrapperDefinition);
 
     // Everything here and below is just so we can insert this into
     // FunctionWrappers
@@ -3327,10 +3242,11 @@ private:
         FD = FTD->getTemplatedDecl();
       }
     }
-    auto [Scopes, FullyScopedName] = GetScopes(FD);
-    if (!FullyScopedName.empty())
-      FullyScopedName += "::";
-    FullyScopedName += FD->getNameAsString() + TypenameSuffix;
+    // auto [Scopes, FullyScopedName] = GetScopes(FD);
+    // if (!FullyScopedName.empty())
+    //   FullyScopedName += "::";
+    // FullyScopedName += FD->getNameAsString() + TypenameSuffix;
+    FullyScopedName += TypenameSuffix;
 
     std::string NewWrapperFunctionDefinition = "";
 
@@ -3394,8 +3310,10 @@ private:
         GetNewWrapperReturnType(CE, CE->getConstructor(), ClassName);
     std::string NewWrapperName = GetNewWrapperName(FD, ClassName);
 
-    std::string NewWrapper = NewWrapperReturnType + " " + NewWrapperName + "(" +
-                             InstantiatedParameters + ");\n";
+    std::string NewWrapperSignature = NewWrapperReturnType + " " +
+                                      NewWrapperName + "(" +
+                                      InstantiatedParameters + ")";
+    std::string NewWrapperDeclaration = NewWrapperSignature + ";\n";
     std::string NewWrapperCall = NewWrapperName + "(" + Arguments + ")";
 
     // This condition is false if the constructor does not look
@@ -3413,7 +3331,24 @@ private:
     // if (Err)
     //   llvm::report_fatal_error(std::move(Err));
 
-    FunctionForwardDeclarations[SeenDecl->getID()].insert(NewWrapper);
+    FunctionForwardDeclarations[SeenDecl->getID()].insert(
+        NewWrapperDeclaration);
+
+    // Now create the wrapper definitions
+    bool ReturnsClassByValue = false;
+    std::string FunctionName = FD->getNameAsString();
+    auto [FDScopes, FDFullyScopedName] = GetScopes(FD);
+    if (!FDFullyScopedName.empty())
+      FDFullyScopedName += "::";
+    FDFullyScopedName += FunctionName;
+
+    std::string NewWrapperDefinition = GenerateWrapperDefinition(
+        NewWrapperSignature, NewWrapperReturnType, ReturnsClassByValue,
+        FunctionName, FDFullyScopedName, FullyScopedClassName,
+        WrapperInfo::WrapperType::Constructor, std::move(NewWrapperParameters),
+        "");
+
+    WrapperFunctionDefinitions[SeenDecl->getID()].insert(NewWrapperDefinition);
 
     // Everything here and below is just so we can insert this into
     // FunctionWrappers
@@ -3441,10 +3376,11 @@ private:
         FD = FTD->getTemplatedDecl();
       }
     }
-    auto [FDScopes, FDFullyScopedName] = GetScopes(FD);
-    if (!FDFullyScopedName.empty())
-      FDFullyScopedName += "::";
-    FDFullyScopedName += FD->getNameAsString() + TypenameSuffix;
+    // auto [FDScopes, FDFullyScopedName] = GetScopes(FD);
+    // if (!FDFullyScopedName.empty())
+    //   FDFullyScopedName += "::";
+    // FDFullyScopedName += FD->getNameAsString() + TypenameSuffix;
+    FDFullyScopedName += TypenameSuffix;
 
     std::string NewWrapperFunctionDefinition = "";
 
@@ -4282,9 +4218,11 @@ int main(int argc, const char **argv) {
   ClangTool IncludeTool(OptionsParser.getCompilations(),
                         OptionsParser.getSourcePathList());
   auto ActionFactory = newFrontendActionFactory<IncludeFinderAction>();
+  GlobalSourceFiles.insert(SourcePaths.begin(), SourcePaths.end());
+  GlobalSourceFiles.insert(InputHeaders.begin(), InputHeaders.end());
   IncludeTool.run(ActionFactory.get());
 
-  WriteWrappersFile("wrappers.yalla.cpp", IncludedFiles,
+  WriteWrappersFile("wrappers.yalla.cpp", GlobalIncludedFiles,
                     YM.GetWrapperDefinitions(),
                     YM.GetClassTemplateInstantiations(),
                     YM.GetFunctionTemplateInstantiations());
