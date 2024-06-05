@@ -149,6 +149,12 @@ public:
     for (const auto &[NodeID, ForwardDeclarations] :
          FunctionForwardDeclarations) {
       if (DeclarationsUsed.count(NodeID) > 0) {
+
+        // These functions were made into wrappers, no need to forward
+        // declare them
+        if (ForcedWrapperIDs.count(NodeID) > 0)
+          continue;
+
         for (const std::string &ForwardDeclaration : ForwardDeclarations)
           AllForwardDeclarations += ForwardDeclaration;
       }
@@ -521,6 +527,11 @@ private:
   // with shadowing (this set is not unordered due to hashing issues).
   std::set<std::pair<std::string, const DeclContext *>> MadeIntoPointers;
   mutable DAG ClassDag;
+  // These are functions from boost that use weird
+  // templates in their args
+  const std::unordered_set<std::string> ForcedWrappers = {
+      "async_read", "async_write", "regex_searcg"};
+  std::unordered_set<int64_t> ForcedWrapperIDs;
 
   // Implicitly generated Ctor initializers we want to mark as skip
   // because they mess up code generation (specifically functor.hpp)
@@ -3008,7 +3019,7 @@ private:
     auto [temp0, temp1, temp2] = GetNewWrapperParamInfo<CallExpr>(CE, FD);
 
     InstantiatedParameters += temp0;
-    if (temp0.empty()) {
+    if (temp0.empty() && !InstantiatedParameters.empty()) {
       InstantiatedParameters.pop_back();
       InstantiatedParameters.pop_back();
     }
@@ -3259,7 +3270,6 @@ private:
     std::string NewWrapperName = GetNewWrapperName(FD, ClassName);
 
     auto [NamespaceStart, NamespaceEnd, ScopingOperator] = GetNamespace(FD);
-
     std::string NewWrapperSignature = NewWrapperReturnType + " " +
                                       NewWrapperName + "(" +
                                       InstantiatedParameters + ")";
@@ -3275,7 +3285,7 @@ private:
     Replacement NewReplacement(FD->getASTContext().getSourceManager(), Range,
                                NewWrapperCall);
     llvm::Error Err = Replace[Filename].add(NewReplacement);
-    if (Err && FD->getNameAsString() == "imread") {
+    if (Err) {
       bool Overlaps = false;
       Replacement OverlappingReplacement;
       for (const Replacement &Existing : Replace[Filename]) {
@@ -3287,7 +3297,8 @@ private:
       }
 
       if (Overlaps) {
-        std::string MergedReplacementText = OverlappingReplacement.toString();
+        std::string MergedReplacementText =
+            OverlappingReplacement.getReplacementText().str();
 
         LangOptions LangOpts;
         PrintingPolicy Policy(LangOpts);
@@ -3370,10 +3381,12 @@ private:
     }
 
     bool YallaObjectIsReference = false;
-    if (WrapperType == WrapperInfo::Method ||
-        WrapperType == WrapperInfo::StaticMethod) {
-      if (NewWrapperParameterTypes[0].back() == '&')
-        YallaObjectIsReference = true;
+    if (NewWrapperParameterTypes.size() > 0) {
+      if (WrapperType == WrapperInfo::Method ||
+          WrapperType == WrapperInfo::StaticMethod) {
+        if (NewWrapperParameterTypes[0].back() == '&')
+          YallaObjectIsReference = true;
+      }
     }
 
     // This is for operator calls, like Mat m = otherMat which uses
@@ -3419,6 +3432,7 @@ private:
         FD = FTD->getTemplatedDecl();
       }
     }
+
     // auto [Scopes, FullyScopedName] = GetScopes(FD);
     // if (!FullyScopedName.empty())
     //   FullyScopedName += "::";
@@ -3748,6 +3762,7 @@ private:
     DeclarationsUsed.insert(SeenDecl->getID());
 
     QualType ReturnType = FD->getReturnType();
+
     if (ReturnType.getAsString().find("std::enable_if_t") == std::string::npos)
       AddReturnTypeToUsages(ReturnType);
     for (const auto &Param : FD->parameters()) {
@@ -3756,9 +3771,14 @@ private:
         AddReturnTypeToUsages(QT);
     }
 
+    bool ForceIntoWrapper = ForcedWrappers.count(FD->getNameAsString()) > 0;
+    if (ForceIntoWrapper)
+      ForcedWrapperIDs.insert(FD->getID());
+
     if (FD->isTemplateInstantiation() || FD->isCXXClassMember() ||
         ArgumentsWillBeMadePointers || ReturnTypeShouldBeMadePointer ||
-        IsMethodOfTemplatedClassThatUsesIncompleteType || UsesEnum) {
+        IsMethodOfTemplatedClassThatUsesIncompleteType || UsesEnum ||
+        ForceIntoWrapper) {
       AddNewWrappers(CE);
     }
 
