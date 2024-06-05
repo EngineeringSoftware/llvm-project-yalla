@@ -420,6 +420,16 @@ public:
 
       if (!CCI->isWritten())
         ImplicitCtorInitializers.insert(CCE);
+
+      if (CCI->isMemberInitializer()) {
+        const CXXConstructExpr *CCE =
+            dyn_cast<CXXConstructExpr>(CCI->getInit());
+        if (!CCE)
+          return;
+
+        AddConstructorUsage(CCE, FileName, nullptr, CCI);
+        // AddConstructorUsage(CCI->)
+      }
     }
 
     if (const MemberExpr *ME =
@@ -2994,6 +3004,7 @@ private:
     }
 
     auto [temp0, temp1, temp2] = GetNewWrapperParamInfo<CallExpr>(CE, FD);
+
     InstantiatedParameters += temp0;
     if (temp0.empty()) {
       InstantiatedParameters.pop_back();
@@ -3035,7 +3046,10 @@ private:
     for (const auto &Arg : CE->arguments()) {
       std::string ParamType =
           GetTypeWithAllScopes(Arg->getType(), FD->getASTContext());
-      AddReturnTypeToUsages(GetBaseType(Arg->getType()));
+
+      if (Arg->getType().getAsString().find("std::enable_if_t") ==
+          std::string::npos)
+        AddReturnTypeToUsages(GetBaseType(Arg->getType()));
 
       QualType ActualType = RemoveElaboratedAndTypedef(Arg->getType());
 
@@ -3073,6 +3087,10 @@ private:
         ParamName = FD->getParamDecl(current)->getNameAsString();
       else
         ParamName = "YallaParam_" + std::to_string(current);
+
+      // Parameter packs will have the same name for different
+      // arguments, so we add this to disambiguate.
+      ParamName += "_" + std::to_string(current);
 
       // Create a copy with the default arg since we don't want to add
       // the default arg to the actual function call
@@ -3415,7 +3433,7 @@ private:
   }
 
   void AddNewWrappers(const CXXConstructExpr *CE, const CharSourceRange &Range,
-                      const std::string &VarDeclName = "") {
+                      const std::string &VarDeclName = "", bool isCCI = false) {
     const FunctionDecl *FD = CE->getConstructor();
 
     const RecordDecl *RD = CE->getConstructor()->getParent();
@@ -3478,6 +3496,11 @@ private:
     // sure why, but the ranges are affected differently.
     if (VarDeclName != "")
       NewWrapperCall = VarDeclName + " = " + NewWrapperCall;
+
+    // This constructor appears in a member initializer list, e.g. cons() : a(a)
+    // {}
+    if (isCCI)
+      NewWrapperCall = "(" + NewWrapperCall + ")";
 
     std::string Filename = GetContainingFile(CE);
     llvm::Error Err = Replace[Filename].add(Replacement(
@@ -3698,10 +3721,12 @@ private:
     DeclarationsUsed.insert(SeenDecl->getID());
 
     QualType ReturnType = FD->getReturnType();
-    AddReturnTypeToUsages(ReturnType);
+    if (ReturnType.getAsString().find("std::enable_if_t") == std::string::npos)
+      AddReturnTypeToUsages(ReturnType);
     for (const auto &Param : FD->parameters()) {
       QualType QT = GetBaseType(Param->getType()).getUnqualifiedType();
-      AddReturnTypeToUsages(QT);
+      if (QT.getAsString().find("std::enable_if_t") == std::string::npos)
+        AddReturnTypeToUsages(QT);
     }
 
     if (FD->isTemplateInstantiation() || FD->isCXXClassMember() ||
@@ -3752,7 +3777,8 @@ private:
 
   void AddConstructorUsage(const CXXConstructExpr *CE,
                            const std::string &FileName,
-                           const CXXNewExpr *CNE = nullptr) {
+                           const CXXNewExpr *CNE = nullptr,
+                           const CXXCtorInitializer *CCI = nullptr) {
     const CXXConstructorDecl *FD = CE->getConstructor();
 
     if (isFromStandardLibrary(FD) || isDefinedInMainSourceFile(FD))
@@ -3803,12 +3829,17 @@ private:
     //   llvm::report_fatal_error("Constructor needs wrapper but none found");
 
     CharSourceRange Range;
+    bool isCCI = false;
     if (CNE)
       Range = CharSourceRange::getTokenRange(CNE->getSourceRange());
-    else
+    else if (CCI) {
+      isCCI = true;
+      Range = CharSourceRange::getTokenRange(CCI->getLParenLoc(),
+                                             CCI->getRParenLoc());
+    } else
       Range = CharSourceRange::getTokenRange(CE->getSourceRange());
 
-    AddNewWrappers(CE, Range);
+    AddNewWrappers(CE, Range, "", isCCI);
     // std::string Filename = GetContainingFile(CE);
 
     // auto [WrapperCall, WrapperArgumentTypes] =
