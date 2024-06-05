@@ -1301,6 +1301,7 @@ private:
         if (OriginalName.find(Troublesome) != std::string::npos)
           OriginalName.replace(OriginalName.find(Troublesome),
                                Troublesome.length(), "");
+        std::replace(OriginalName.begin(), OriginalName.end(), ' ', '_');
       }
 
       WrapperName = "Wrapper_" + OriginalName;
@@ -2875,6 +2876,7 @@ private:
         if (OriginalName.find(Troublesome) != std::string::npos)
           OriginalName.replace(OriginalName.find(Troublesome),
                                Troublesome.length(), "");
+        std::replace(OriginalName.begin(), OriginalName.end(), ' ', '_');
       }
 
       WrapperName = "Wrapper_" + OriginalName;
@@ -3634,12 +3636,37 @@ private:
     return false;
   }
 
+  void HandleLocalFunction(const CallExpr *CE) {
+    const FunctionDecl *FD = CE->getDirectCallee();
+    AddReturnTypeToUsages(FD->getReturnType());
+
+    CharSourceRange Range =
+        CharSourceRange::getTokenRange(FD->getTypeSourceInfo()
+                                           ->getTypeLoc()
+                                           .getNextTypeLoc()
+                                           .getSourceRange());
+    std::string ReturnType = GetTypeWithAllScopes(
+        CE->getCallReturnType(FD->getASTContext()), FD->getASTContext());
+
+    ReturnType += "*";
+
+    std::string DefinitionFilename = getAbsolutePath(GetContainingFile(FD));
+    llvm::Error Err = Replace[DefinitionFilename].add(
+        Replacement(FD->getASTContext().getSourceManager(), Range, ReturnType));
+    if (Err)
+      llvm::report_fatal_error(std::move(Err));
+  }
+
   void AddFunctionUsage(const CallExpr *CE) {
     const FunctionDecl *FD = CE->getDirectCallee();
     std::string DefinitionFilename = GetContainingFile(FD);
 
-    if (isDefinedInMainSourceFile(FD))
+    // Have to change the return type in the signature
+    if (isDefinedInMainSourceFile(FD) &&
+        ShouldBeMadeIntoPointer(CE->getCallReturnType(FD->getASTContext()))) {
+      HandleLocalFunction(CE);
       return;
+    }
 
     bool ArgumentsWillBeMadePointers = false;
     // if (!inSubstitutedHeader(GetContainingFile(FD))) {
