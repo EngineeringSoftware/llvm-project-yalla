@@ -630,6 +630,7 @@ private:
 
     llvm::StringRef filename = presumedLoc.getFilename();
     if (filename.startswith("/usr/include/c++/") ||
+        filename.startswith("/usr/include/") ||
         filename.startswith("/usr/lib/gcc/")) {
       return true;
     }
